@@ -19,26 +19,25 @@ class PlannerAgent:
         
         # System prompt for logical planning
         self.prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a data architect specializing in SQL query planning.
+            ("system", """You are a data architect specializing in Nielsen POS SQL query planning.
+The database has a SINGLE table called `nielsen_pos`.
 
-Your task: Decompose the user's question into clear logical steps.
+Your task: Decompose the user's question into clear, numbered logical steps.
 
 Guidelines:
-1. Identify the core intent (aggregation, comparison, trend analysis, joins)
-2. Break down into atomic logical steps
-3. Define metrics and formulas explicitly
-4. Specify filters, groupings, and ordering needed
+1. Identify the core intent (market share, period comparison, performance tracking, growth analysis)
+2. Resolve follow-up references — if the question says "same product" or "that brand", use the
+   conversation history to identify what it refers to and name it explicitly in the plan
+3. Break down into atomic logical steps: filters → aggregations → calculations → comparisons
+4. Define metrics and formulas explicitly (e.g., market_share = entity_sales / total_market_sales)
+5. Always specify the geographic filter priority:
+   customer named? → filter by customer; division named? → filter by division;
+   market named? → filter by market; otherwise → total = 'Total US xAOC + Conv'
+6. Output: A clear, numbered plan only. Do NOT write SQL.
 
-Output: A clear, numbered plan. Do NOT write SQL code.
-
-Example:
-Question: "What is the average order value by customer segment?"
-Plan:
-1. Join orders table with customers table
-2. Calculate AVG(order_total) for each customer
-3. Group by customer.segment
-4. Order by average value descending"""),
-            ("user", "{question}")
+Conversation history (for resolving follow-up questions):
+{conversation_history}"""),
+            ("user", "Question: {question}")
         ])
         
         self.chain = self.prompt | self.llm
@@ -47,9 +46,22 @@ Plan:
         """Generate a logical plan for the question."""
         logger.info("PLANNER: Decomposing question into logical steps")
         question = state["question"]
+
+        # Build conversation history text for follow-up resolution
+        history = state.get("conversation_history") or []
+        if history:
+            history_text = "\n\n".join(
+                f"Q: {h['question']}\nA: {h['nl_response']}"
+                for h in history[-4:]
+            )
+        else:
+            history_text = "None — this is the first question"
         
         try:
-            response = self.chain.invoke({"question": question})
+            response = self.chain.invoke({
+                "question": question,
+                "conversation_history": history_text,
+            })
             plan = response.content
             
             # Extract numbered steps from the plan

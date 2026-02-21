@@ -306,7 +306,8 @@ class DataLoader:
 def setup_database_from_files(
     source_path: str,
     db_path: str = "./data/database.db",
-    if_exists: str = 'replace'
+    if_exists: str = 'replace',
+    table_name: Optional[str] = None
 ) -> Dict[str, any]:
     """
     Convenience function to set up database from files or directory.
@@ -315,6 +316,8 @@ def setup_database_from_files(
         source_path: Path to file or directory containing data files
         db_path: Path to SQLite database
         if_exists: What to do if tables exist ('fail', 'replace', 'append')
+        table_name: Optional explicit table name (auto-generated from filename if None).
+                    Only applied when loading a single file.
         
     Returns:
         Summary of loaded data
@@ -327,15 +330,18 @@ def setup_database_from_files(
         if source.suffix.lower() in ['.xlsx', '.xls']:
             # Check if it has multiple sheets
             excel_file = pd.ExcelFile(source)
-            if len(excel_file.sheet_names) > 1:
+            if len(excel_file.sheet_names) > 1 and table_name is None:
                 logger.info(f"Loading Excel file with {len(excel_file.sheet_names)} sheets")
                 results = loader.load_excel_sheets(source, if_exists=if_exists)
             else:
-                results = [loader.load_file(source, if_exists=if_exists)]
+                # Single sheet or explicit table name override
+                results = [loader.load_file(source, table_name=table_name, if_exists=if_exists)]
         else:
-            results = [loader.load_file(source, if_exists=if_exists)]
+            results = [loader.load_file(source, table_name=table_name, if_exists=if_exists)]
     elif source.is_dir():
-        # Directory
+        # Directory – table_name override is ignored for directories
+        if table_name:
+            logger.warning("table_name is ignored when loading from a directory")
         results = loader.load_directory(source, if_exists=if_exists)
     else:
         raise ValueError(f"Invalid source path: {source_path}")

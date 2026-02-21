@@ -1,5 +1,6 @@
 """
 Vector store for dynamic few-shot example retrieval.
+Examples are sourced from nielsen_few_shots.yaml.
 """
 
 from typing import List, Dict
@@ -9,6 +10,7 @@ from langchain_core.documents import Document
 from loguru import logger
 from config import settings
 import os
+import yaml
 
 
 class FewShotRetriever:
@@ -39,6 +41,93 @@ class FewShotRetriever:
         )
         
         logger.info(f"Few-shot retriever initialized with ChromaDB")
+        
+        # Auto-seed from YAML when the collection is empty
+        if self.vectorstore._collection.count() == 0:
+            logger.info("Vector store is empty – seeding from nielsen_few_shots.yaml")
+            self._seed_from_yaml()
+    
+    # ------------------------------------------------------------------
+    # YAML loading
+    # ------------------------------------------------------------------
+
+    def _load_yaml_examples(self, yaml_path: str) -> List[Dict]:
+        """
+        Parse nielsen_few_shots.yaml and return a flat list of example dicts.
+
+        Each entry in the YAML has this shape (under a category key):
+            - query: <natural language question>
+              sql:   <SQL string>
+              explanation: <optional string>
+
+        Returns:
+            List of dicts with keys: question, sql, explanation, category
+        """
+        examples = []
+        try:
+            with open(yaml_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+
+            if not isinstance(data, dict):
+                logger.warning(f"Unexpected YAML structure in {yaml_path}")
+                return examples
+
+            for category, entries in data.items():
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    # Skip malformed entries or nested category keys (YAML quirk)
+                    if not isinstance(entry, dict):
+                        continue
+                    query = entry.get("query") or entry.get("question")
+                    sql = entry.get("sql")
+                    if not query or not sql:
+                        continue
+                    examples.append({
+                        "question": query.strip(),
+                        "sql": sql.strip() if isinstance(sql, str) else sql,
+                        "explanation": (entry.get("explanation") or "").strip(),
+                        "category": category,
+                    })
+
+        except FileNotFoundError:
+            logger.error(f"Few-shots YAML not found: {yaml_path}")
+        except yaml.YAMLError as exc:
+            logger.error(f"Failed to parse YAML {yaml_path}: {exc}")
+
+        return examples
+
+    def _seed_from_yaml(self, yaml_path: str = None):
+        """Load examples from the YAML file and add them to the vector store."""
+        if yaml_path is None:
+            # Resolve relative to this file → project root
+            yaml_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "nielsen_few_shots.yaml"
+            )
+
+        examples = self._load_yaml_examples(yaml_path)
+        if not examples:
+            logger.warning("No examples loaded from YAML – vector store left empty")
+            return
+
+        try:
+            docs = []
+            for ex in examples:
+                docs.append(Document(
+                    page_content=ex["question"],
+                    metadata={
+                        "sql": ex["sql"],
+                        "explanation": ex["explanation"],
+                        "category": ex["category"],
+                        "schema_context": "",
+                        "complexity": "domain-specific",
+                    }
+                ))
+            self.vectorstore.add_documents(docs)
+            logger.info(f"Seeded {len(docs)} Nielsen examples into vector store")
+        except Exception as e:
+            logger.error(f"Error seeding from YAML: {e}")
     
     def add_example(self, question: str, sql: str, explanation: str = None, 
                     schema_context: str = None, complexity: str = "medium"):
@@ -129,7 +218,8 @@ class FewShotRetriever:
                     "sql": doc.metadata.get("sql", ""),
                     "explanation": doc.metadata.get("explanation", ""),
                     "schema_context": doc.metadata.get("schema_context", ""),
-                    "complexity": doc.metadata.get("complexity", "medium")
+                    "category": doc.metadata.get("category", ""),
+                    "complexity": doc.metadata.get("complexity", "domain-specific")
                 })
             
             logger.info(f"Retrieved {len(examples)} similar examples")
@@ -151,56 +241,25 @@ class FewShotRetriever:
 few_shot_retriever = FewShotRetriever()
 
 
-def seed_examples():
+def seed_examples(yaml_path: str = None):
     """
-    Seed the vector store with common SQL patterns.
-    This should be called during setup with your domain-specific examples.
+    Seed (or re-seed) the vector store from nielsen_few_shots.yaml.
+
+    Clears the existing collection first so that re-runs stay idempotent.
+    Pass ``yaml_path`` to override the default location (project root).
     """
     if not settings.enable_dynamic_few_shot:
         return
-    
-    default_examples = [
-        {
-            "question": "What is the total revenue for each product category?",
-            "sql": """SELECT 
-    category,
-    SUM(price * quantity) as total_revenue
-FROM products p
-JOIN sales s ON p.product_id = s.product_id
-GROUP BY category
-ORDER BY total_revenue DESC""",
-            "explanation": "Join products with sales and aggregate by category",
-            "complexity": "simple"
-        },
-        {
-            "question": "Find customers who made purchases in the last 30 days but not in the previous 30 days",
-            "sql": """SELECT DISTINCT c.customer_id, c.name
-FROM customers c
-JOIN orders o ON c.customer_id = o.customer_id
-WHERE o.order_date >= CURRENT_DATE - INTERVAL '30 days'
-  AND c.customer_id NOT IN (
-    SELECT customer_id 
-    FROM orders 
-    WHERE order_date >= CURRENT_DATE - INTERVAL '60 days'
-      AND order_date < CURRENT_DATE - INTERVAL '30 days'
-  )""",
-            "explanation": "Use subquery to exclude customers from previous period",
-            "complexity": "complex"
-        },
-        {
-            "question": "Calculate the 3-month rolling average of sales",
-            "sql": """SELECT 
-    DATE_TRUNC('month', sale_date) as month,
-    AVG(sale_amount) OVER (
-        ORDER BY DATE_TRUNC('month', sale_date)
-        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
-    ) as rolling_3month_avg
-FROM sales
-ORDER BY month""",
-            "explanation": "Use window function with ROWS BETWEEN for rolling average",
-            "complexity": "complex"
-        }
-    ]
-    
-    few_shot_retriever.add_examples_batch(default_examples)
-    logger.info(f"Seeded {len(default_examples)} default examples")
+
+    # Wipe existing data so we don't accumulate duplicates
+    few_shot_retriever.clear()
+
+    # Re-initialise the collection after clear()
+    few_shot_retriever.vectorstore = Chroma(
+        collection_name=settings.chroma_collection_name,
+        embedding_function=few_shot_retriever.embeddings,
+        persist_directory=settings.vector_store_path,
+    )
+
+    few_shot_retriever._seed_from_yaml(yaml_path=yaml_path)
+    logger.info("seed_examples() completed – vector store ready")

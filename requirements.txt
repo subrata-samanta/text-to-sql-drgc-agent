@@ -33,3 +33,6 @@ openpyxl>=3.1.0
 
 # Logging
 loguru>=0.7.0
+
+# CLI rich output
+rich>=13.0.0

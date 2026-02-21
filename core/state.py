@@ -44,9 +44,24 @@ class AgentState(TypedDict):
     iterations: int  # Number of correction attempts
     should_retry: bool  # Whether to attempt correction
     
-    # Conversation History
+    # Natural Language Response (generated after SQL execution)
+    nl_response: Optional[str]  # LLM-generated answer in plain English
+
+    # Multi-turn conversation history passed in by the caller
+    conversation_history: Optional[List[Dict[str, Any]]]  # [{question, nl_response}, ...]
+
+    # Conversation History (LangGraph message accumulator)
     messages: Annotated[List[BaseMessage], operator.add]
-    
+
+    # Intent classification (set by InteractionAgent — first node)
+    intent: Optional[str]          # data_query | follow_up | smalltalk | clarification | out_of_scope
+    direct_response: Optional[str] # Pre-built reply for non-data intents (skips SQL pipeline)
+
+    # SQL Validation (set by SQLValidatorAgent)
+    validation_passed: Optional[bool]       # True = SQL is semantically correct
+    validation_issues: Optional[List[str]]  # Human-readable list of problems found
+    sql_validation_attempts: Optional[int]  # Guard against infinite validation loops
+
     # Metadata
     start_time: Optional[float]  # For latency tracking
     cache_hit: Optional[bool]  # Whether result came from cache

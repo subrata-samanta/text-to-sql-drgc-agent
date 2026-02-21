@@ -143,9 +143,12 @@ class DatabaseManager:
                 
                 # Fetch results for SELECT queries
                 if result.returns_rows:
+                    columns = list(result.keys())
                     rows = result.fetchall()
+                    # Convert to plain list of dicts so results are portable
+                    rows_as_dicts = [dict(zip(columns, row)) for row in rows]
                     execution_time = (time.time() - start) * 1000
-                    return rows, None, execution_time
+                    return rows_as_dicts, None, execution_time
                 else:
                     execution_time = (time.time() - start) * 1000
                     return f"Query executed successfully. Rows affected: {result.rowcount}", None, execution_time

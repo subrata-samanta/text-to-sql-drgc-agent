@@ -1,159 +1,281 @@
 """
-Schema Linker Agent (Selector): Identifies relevant tables and columns.
+Schema Linker Agent: Identifies relevant columns from the Nielsen POS schema
+and builds rich schema context (with CTE SQL conventions) for SQL generation.
 """
 
-from typing import List
+import os
+import sys
+from typing import List, Dict
+
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from loguru import logger
+
 from core.state import AgentState
-from core.database import db_manager
 from config import settings
 
+# ── Import the definitive Nielsen schema ─────────────────────────────────────
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from nielsen_schema import schema as NIELSEN_SCHEMA           # noqa: E402
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Schema helpers (computed once at import time)
+# ─────────────────────────────────────────────────────────────────────────────
+
+TABLE_NAME: str = NIELSEN_SCHEMA["table"]    # "nielsen_pos"
+_COLUMNS: dict  = NIELSEN_SCHEMA["columns"]  # nested dict keyed by group
+
+
+def _build_full_schema_text() -> str:
+    """
+    Render the full Nielsen schema as a structured text block that can be
+    dropped verbatim into an LLM prompt.
+    """
+    lines = [f"TABLE: {TABLE_NAME}", "=" * 70]
+    for group, cols in _COLUMNS.items():
+        lines.append(f"\n── {group.upper().replace('_', ' ')} ──")
+        for col_name, description in cols.items():
+            lines.append(f"  • {col_name}:{description}")
+    return "\n".join(lines)
+
+
+def _flat_column_list() -> List[str]:
+    """Return a flat list of every column name in the schema."""
+    cols: List[str] = []
+    for group_cols in _COLUMNS.values():
+        cols.extend(group_cols.keys())
+    return cols
+
+
+FULL_SCHEMA_TEXT: str  = _build_full_schema_text()
+ALL_COLUMNS: List[str] = _flat_column_list()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CTE convention block (appended to every schema context handed to generator)
+# ─────────────────────────────────────────────────────────────────────────────
+
+CTE_CONVENTIONS = f"""
+══════════════════════════════════════════════════════════════════════════
+SQL GENERATION RULES  –  MANDATORY FOR EVERY QUERY
+══════════════════════════════════════════════════════════════════════════
+1. ALWAYS write SQL using CTEs (WITH … AS (…)).  NEVER write flat queries.
+2. Give each CTE a descriptive snake_case name that reflects its purpose
+   (e.g., entity_sales, total_market_sales, period1_sales, ytd_current).
+3. The ONLY table is:  {TABLE_NAME}
+4. Every query MUST include exactly ONE geographic filter (priority order):
+     a. customer  is mentioned → AND customer = '…'          (omit total / market)
+     b. division  is mentioned → AND division = '…'          (omit total / market)
+     c. market    is mentioned → AND market   = '…'          (omit total)
+     d. (default)              → AND total    = 'Total US xAOC + Conv'
+5. Use NULLIF(denominator, 0) in every division operation.
+6. Round all percentages / ratios with ROUND(…, 2).
+7. Alias every computed column with a meaningful snake_case name.
+8. TDP average  →  SUM(tdp) / COUNT(DISTINCT period_date)
+9. Velocity     →  SUM(sales_units) / SUM(tdp)
+10. Display must NEVER be aggregated with SUM – use weighted average only.
+
+──────────────────────────────────────────────────────────────────────────
+CTE SKELETON  (adapt structure and names to the question)
+──────────────────────────────────────────────────────────────────────────
+WITH <entity_cte> AS (
+    SELECT SUM(sales_dollar) AS entity_sales
+    FROM {TABLE_NAME}
+    WHERE <product_filter>
+      AND <temporal_filter>               -- year_month / period_date / year_nielsen
+      AND total = 'Total US xAOC + Conv'  -- or customer / division / market filter
+),
+<market_cte> AS (
+    SELECT SUM(sales_dollar) AS total_sales
+    FROM {TABLE_NAME}
+    WHERE <broader_category_filter>
+      AND <temporal_filter>
+      AND total = 'Total US xAOC + Conv'
+)
+SELECT
+    ROUND(
+        (<entity_cte>.entity_sales / NULLIF(<market_cte>.total_sales, 0)) * 100.0,
+        2
+    ) AS market_share_pct
+FROM <entity_cte>, <market_cte>;
+══════════════════════════════════════════════════════════════════════════
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Agent
+# ─────────────────────────────────────────────────────────────────────────────
 
 class SchemaLinkerAgent:
     """
-    Performs schema pruning to reduce context noise.
-    Identifies only the relevant tables and columns needed for the query.
+    Schema-linking agent tailored to the Nielsen POS single-table model.
+
+    Responsibilities
+    ────────────────
+    • Identify which columns from ``nielsen_pos`` are relevant to the question.
+    • Surface column semantics (types, business rules) from nielsen_schema.py.
+    • Inject CTE SQL conventions into every schema context it produces.
     """
-    
+
     def __init__(self):
-        # Use faster model for schema selection
         self.llm = ChatGroq(
             model=settings.groq_model_fast,
             temperature=0,
-            groq_api_key=settings.groq_api_key
+            groq_api_key=settings.groq_api_key,
         )
-        
-        # Prompt for table selection
-        self.table_selection_prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a database schema expert. Identify which tables are relevant for the user's question.
 
-Instructions:
-1. Analyze the question and logical plan
-2. Select ONLY tables that are strictly necessary
-3. Be conservative - include a table only if clearly needed
-4. Return ONLY a comma-separated list of table names (no explanations)
+        # ── Column-selection prompt ──────────────────────────────────────────
+        self.column_selection_prompt = ChatPromptTemplate.from_messages([
+            ("system", f"""You are a Nielsen POS data expert. The database contains exactly ONE table:
 
-Example:
-Question: "What is the average order value by customer segment?"
-Available Tables: customers, orders, products, invoices, shipments, employees
-Response: customers, orders"""),
+  Table: {TABLE_NAME}
+
+FULL SCHEMA:
+{FULL_SCHEMA_TEXT}
+
+══════════════════════════════════════════════════════════════════════════
+COLUMN SELECTION RULES
+══════════════════════════════════════════════════════════════════════════
+Return ONLY the column names strictly needed, as a comma-separated list.
+No explanations. No extra text.
+
+GEOGRAPHIC PRIORITY (pick exactly ONE group):
+  • customer  named → include: customer
+  • division  named → include: division
+  • market    named → include: market
+  • default         → include: total
+
+TEMPORAL RULES:
+  • weekly / specific week    → period_date
+  • monthly / multi-month     → year_month
+  • quarterly                 → quarter_nielsen  (+ year_nielsen)
+  • annual / YTD              → year_nielsen     (+ year_month for YTD)
+
+METRIC RULES:
+  • "sales" / "revenue"       → sales_dollar
+  • "units"                   → sales_units
+  • "TDP" / "distribution"    → tdp
+  • "velocity"                → sales_units, tdp
+  • "display"                 → display
+  • market share              → sales_dollar  (both numerator & denominator)
+  • promotional question      → relevant sales_dollar_with_* / sales_units_with_*
+
+Always include: one temporal column + one geographic column + metric column(s).
+
+EXAMPLE:
+  Question: "What was OREO brand dollar market share in Q3 2024?"
+  Response: year_month, quarter_nielsen, year_nielsen, total, brand, category, sales_dollar"""),
             ("user", """Question: {question}
 
 Plan: {plan}
 
-Available Tables: {all_tables}
+All available columns: {all_columns}
 
-Return comma-separated table names:""")
+Comma-separated column names only:"""),
         ])
-        
-        # Prompt for column selection (optional, currently not used)
-        self.column_selection_prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a database schema expert. Identify which columns are needed for the query.
 
-Return a JSON object mapping table names to lists of required columns.
+    # ─────────────────────────────────────────────────────────────────────────
+    # Internal helpers
+    # ─────────────────────────────────────────────────────────────────────────
 
-Example: {"customers": ["customer_id", "segment"], "orders": ["order_id", "customer_id", "total_amount"]}
-
-Include only columns used in:
-- SELECT clause
-- WHERE/HAVING conditions  
-- JOIN conditions
-- GROUP BY or ORDER BY"""),
-            ("user", """Plan: {plan}
-
-Schema: {schema}
-
-Return JSON with required columns:""")
-        ])
-    
-    def select_tables(self, question: str, plan: str, all_tables: List[str]) -> List[str]:
+    def select_columns(self, question: str, plan: str) -> List[str]:
         """
-        Select relevant tables using LLM reasoning.
-        
-        Args:
-            question: User's question
-            plan: Logical plan
-            all_tables: All available table names
-            
+        Ask the LLM which columns are needed; validate against the real schema.
+
         Returns:
-            List of relevant table names
+            List of valid column names from NIELSEN_SCHEMA.
         """
         try:
-            chain = self.table_selection_prompt | self.llm
+            chain = self.column_selection_prompt | self.llm
             response = chain.invoke({
                 "question": question,
                 "plan": plan,
-                "all_tables": ", ".join(all_tables)
+                "all_columns": ", ".join(ALL_COLUMNS),
             })
-            
-            # Parse comma-separated table names
-            selected = [t.strip() for t in response.content.split(",")]
-            # Filter out any invalid table names
-            selected = [t for t in selected if t in all_tables]
-            
-            logger.info(f"Selected {len(selected)} tables from {len(all_tables)} available")
-            return selected
-            
+            selected = [c.strip() for c in response.content.split(",")]
+            # Keep only names that actually exist in the schema
+            selected = [c for c in selected if c in ALL_COLUMNS]
+            logger.info(f"Schema linker selected {len(selected)} columns: {selected}")
+            return selected or ["year_month", "total", "sales_dollar"]
         except Exception as e:
-            logger.error(f"Table selection error: {e}")
-            # Fallback: return top 5 tables (simple heuristic)
-            return all_tables[:5]
-    
+            logger.error(f"Column selection error: {e}")
+            return ["year_month", "total", "sales_dollar"]
+
+    def _build_targeted_schema(self, columns: List[str]) -> str:
+        """
+        Build a concise schema text block containing ONLY the selected columns.
+        """
+        lines = [f"TABLE: {TABLE_NAME}", "=" * 70]
+        for group, cols in _COLUMNS.items():
+            relevant = {col: desc for col, desc in cols.items() if col in columns}
+            if relevant:
+                lines.append(f"\n── {group.upper().replace('_', ' ')} ──")
+                for col_name, desc in relevant.items():
+                    lines.append(f"  • {col_name}:{desc}")
+        return "\n".join(lines)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Main entry point
+    # ─────────────────────────────────────────────────────────────────────────
+
     def retrieve_schema(self, state: AgentState) -> dict:
         """
-        Retrieve and prune schema information to only relevant tables.
-        
-        Args:
-            state: Current agent state
-            
-        Returns:
-            Updated state with schema context
+        Build the schema context for downstream SQL generation.
+
+        State keys written
+        ──────────────────
+        relevant_tables : ["nielsen_pos"]
+        schema_context  : targeted column schema + mandatory CTE conventions
+        schema_metadata : {column → {group, description}} for selected columns
         """
-        logger.info("SCHEMA LINKER: Retrieving relevant tables and schema")
-        
-        question = state["question"]
-        plan = state.get("plan", "")
-        
+        logger.info("SCHEMA LINKER: Selecting relevant Nielsen columns")
+
+        question: str = state["question"]
+        plan: str     = state.get("plan", "")
+
         try:
-            # Step 1: Get all available tables
-            all_tables = db_manager.get_all_table_names()
-            logger.info(f"Database has {len(all_tables)} tables")
-            
-            # Step 2: Select relevant tables using LLM
-            if plan:
-                selected_tables = self.select_tables(question, plan, all_tables)
-            else:
-                # Fallback: use first 10 tables if no plan available
-                selected_tables = all_tables[:10]
-            
-            # Step 3: Retrieve DDL schema for selected tables
-            schema_context = db_manager.get_schema_for_tables(selected_tables)
-            
-            # Step 4: Get metadata (keys, indexes, etc.)
-            schema_metadata = {}
-            for table in selected_tables:
-                metadata = db_manager.get_table_metadata(table)
-                schema_metadata[table] = metadata
-            
-            logger.info(f"Selected {len(selected_tables)} tables: {', '.join(selected_tables)}")
-            
+            selected_cols = self.select_columns(question, plan)
+
+            # Targeted schema for the selected columns + obligatory CTE rules
+            schema_context = self._build_targeted_schema(selected_cols) + CTE_CONVENTIONS
+
+            # Column-level metadata dict for state
+            schema_metadata: Dict[str, dict] = {}
+            for group, cols in _COLUMNS.items():
+                for col_name, desc in cols.items():
+                    if col_name in selected_cols:
+                        schema_metadata[col_name] = {
+                            "group": group,
+                            "description": desc.strip(),
+                        }
+
+            logger.info(
+                f"Schema context ready — table='{TABLE_NAME}', "
+                f"columns selected={len(selected_cols)}"
+            )
+
             return {
-                "relevant_tables": selected_tables,
+                "relevant_tables": [TABLE_NAME],
                 "schema_context": schema_context,
-                "schema_metadata": schema_metadata
+                "schema_metadata": schema_metadata,
             }
-            
+
         except Exception as e:
             logger.error(f"Schema retrieval error: {e}")
+            # Fallback: full schema so generation can still proceed
             return {
+                "relevant_tables": [TABLE_NAME],
+                "schema_context": FULL_SCHEMA_TEXT + CTE_CONVENTIONS,
+                "schema_metadata": {},
                 "error": f"Schema retrieval failed: {str(e)}",
-                "should_retry": False
+                "should_retry": False,
             }
 
 
-# Node function for LangGraph
+# ─────────────────────────────────────────────────────────────────────────────
+# LangGraph node
+# ─────────────────────────────────────────────────────────────────────────────
+
 def schema_linker_node(state: AgentState) -> dict:
     """LangGraph node wrapper for SchemaLinkerAgent."""
     agent = SchemaLinkerAgent()

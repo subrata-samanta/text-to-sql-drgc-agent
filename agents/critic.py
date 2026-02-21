@@ -223,19 +223,25 @@ Generate the CORRECTED SQL:"""),
             return "Query returned no results"
         
         try:
-            # If result is a list of Row objects
-            if hasattr(result[0], '_mapping'):
+            # Handle list of dicts (preferred) or SQLAlchemy Row objects
+            first = result[0]
+            if isinstance(first, dict):
+                rows = result[:max_rows]
+            elif hasattr(first, '_mapping'):
                 rows = [dict(row._mapping) for row in result[:max_rows]]
-                preview = f"Returned {len(result)} row(s). Preview:\n"
-                for i, row in enumerate(rows, 1):
-                    preview += f"Row {i}: {row}\n"
-                
-                if len(result) > max_rows:
-                    preview += f"... ({len(result) - max_rows} more rows)"
-                
-                return preview
+            elif hasattr(first, '_asdict'):
+                rows = [row._asdict() for row in result[:max_rows]]
             else:
                 return str(result[:max_rows])
+
+            preview = f"Returned {len(result)} row(s). Preview:\n"
+            for i, row in enumerate(rows, 1):
+                preview += f"Row {i}: {row}\n"
+
+            if len(result) > max_rows:
+                preview += f"... ({len(result) - max_rows} more rows)"
+
+            return preview
                 
         except Exception as e:
             logger.warning(f"Could not format result: {e}")

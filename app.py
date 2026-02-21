@@ -1,288 +1,354 @@
-"""Streamlit web interface for the Text-to-SQL agent."""
+"""Streamlit chat interface for the Nielsen Text-to-SQL Agent."""
 
 import streamlit as st
 import pandas as pd
 from pathlib import Path
 from loguru import logger
 
-from graph import run_agent
+from graph import stream_agent_steps, stream_nl_response, NODE_LABELS
+from agents.interaction import DATA_INTENTS
 from tools import seed_examples, semantic_cache, few_shot_retriever
 from core.database import db_manager
 from core.data_loader import DataLoader
+from config import settings
 
-# Page configuration
+# ─── page config ──────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Text-to-SQL Agent",
-    page_icon="🔍",
+    page_title="Nielsen Text-to-SQL Agent",
+    page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Title
-st.title("🔍 Text-to-SQL Agent")
-st.markdown("**State-of-the-Art Multi-Agent Architecture for Complex Database Queries**")
-st.markdown("---")
+# ─── session state ──────────────────────────────────────────────────────────────
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "query_count" not in st.session_state:
+    st.session_state.query_count = 0
+if "show_example_form" not in st.session_state:
+    st.session_state.show_example_form = False
 
-# Sidebar configuration
+# ─── helpers ──────────────────────────────────────────────────────────────────────
+
+def _rows_to_df(query_result):
+    """Convert query result (list of dicts or SQLAlchemy Rows) to DataFrame."""
+    if not query_result or not isinstance(query_result, (list, tuple)):
+        return None
+    if len(query_result) == 0:
+        return None
+    try:
+        first = query_result[0]
+        if isinstance(first, dict):
+            return pd.DataFrame(query_result)
+        if hasattr(first, "_mapping"):
+            return pd.DataFrame([dict(r._mapping) for r in query_result])
+        if hasattr(first, "_asdict"):
+            return pd.DataFrame([r._asdict() for r in query_result])
+        if hasattr(first, "keys"):
+            cols = list(first.keys())
+            return pd.DataFrame([dict(zip(cols, r)) for r in query_result])
+        return pd.DataFrame(query_result)
+    except Exception as e:
+        logger.warning(f"Could not convert query result to DataFrame: {e}")
+        return None
+
+
+def _history_for_agent():
+    """Return minimal history list for the agent (question + nl_response only)."""
+    return [
+        {"question": t["question"], "nl_response": t["nl_response"]}
+        for t in st.session_state.chat_history
+        if t.get("nl_response")
+    ]
+
+
+def _render_turn(turn: dict, expanded: bool = False):
+    """Render a single assistant turn.
+
+    Data intents  → Data / SQL / Trace tabs.
+    Direct intents (smalltalk, clarification, out_of_scope) → no tabs.
+    """
+    intent = turn.get("intent") or "data_query"
+    # Skip the details expander for non-data turns that carry no SQL/data
+    if intent not in DATA_INTENTS and not turn.get("sql") and turn.get("df") is None:
+        return
+
+    with st.expander("🔍 Details", expanded=expanded):
+        tabs = st.tabs(["📊 Data", "🗃 SQL", "⚙️ Trace"])
+
+        with tabs[0]:
+            df = turn.get("df")
+            if df is not None and not df.empty:
+                st.dataframe(df, use_container_width=True)
+                st.caption(f"{len(df)} row(s) returned")
+            elif turn.get("error"):
+                st.error(turn["error"])
+            else:
+                st.info("No tabular data returned.")
+
+        with tabs[1]:
+            sql = turn.get("sql") or "—"
+            st.code(sql, language="sql")
+            if sql != "—":
+                st.download_button(
+                    "📋 Download SQL", data=sql,
+                    file_name="query.sql", mime="text/plain",
+                    key=f"dl_{turn.get('idx', 0)}",
+                )
+
+        with tabs[2]:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("SQL exec",   f"{turn.get('exec_time', 0):.0f} ms"  if turn.get("exec_time")  else "—")
+            c2.metric("Total time", f"{turn.get('total_time', 0):.0f} ms" if turn.get("total_time") else "—")
+            c3.metric("Corrections", turn.get("iterations", 0))
+            c4.metric("Cache hit", "✅" if turn.get("cache_hit") else "❌")
+            if turn.get("plan"):
+                st.markdown("**Logical Plan**")
+                st.text(turn["plan"])
+            if turn.get("few_shot_count", 0) > 0:
+                st.caption(f"📚 {turn['few_shot_count']} few-shot example(s) used")
+
+# ─── sidebar ─────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Configuration")
-    
-    # Database info
+
     st.subheader("Database")
-    tables = db_manager.get_all_table_names()
-    st.info(f"Connected: {len(tables)} tables")
-    
-    with st.expander("View Tables"):
-        for table in tables:
-            st.text(f"• {table}")
-    
+    try:
+        tables = db_manager.get_all_table_names()
+        st.success(f"✅ Connected — {', '.join(tables)}")
+    except Exception as e:
+        st.error(f"DB error: {e}")
+
     st.markdown("---")
-    
-    # Agent settings
-    st.subheader("Agent Settings")
-    
-    show_plan = st.checkbox("Show Query Plan", value=True)
-    show_schema = st.checkbox("Show Selected Schema", value=False)
-    show_iterations = st.checkbox("Show Correction Iterations", value=True)
-    
+
+    st.subheader("💬 Conversation")
+    st.metric("Turns", len(st.session_state.chat_history))
+    if st.button("🗑 New Conversation", use_container_width=True):
+        st.session_state.chat_history = []
+        st.rerun()
+
     st.markdown("---")
-    
-    # Tools
-    st.subheader("Tools")
-    
-    if st.button("🌱 Seed Examples"):
-        with st.spinner("Seeding example queries..."):
+
+    st.subheader("🛠️ Tools")
+    if st.button("🌱 Seed Examples", use_container_width=True):
+        with st.spinner("Seeding…"):
             seed_examples()
-        st.success("Examples seeded!")
-    
-    if st.button("🗑️ Clear Cache"):
+        st.success("Examples seeded from nielsen_few_shots.yaml!")
+
+    if st.button("🗑 Clear Cache", use_container_width=True):
         semantic_cache.clear()
         st.success("Cache cleared!")
-    
-    if st.button("📚 Add Custom Example"):
-        st.session_state['show_example_form'] = True
-    
-    # File Upload Section
+
+    if st.button("➕ Add Custom Example", use_container_width=True):
+        st.session_state.show_example_form = True
+
     st.markdown("---")
-    st.subheader("📁 Upload Data")
-    
-    with st.expander("Upload CSV/Excel Files"):
+
+    st.subheader("📂 Upload Data")
+    with st.expander("Upload CSV / Excel"):
         uploaded_files = st.file_uploader(
-            "Choose files",
-            type=['csv', 'xlsx', 'xls'],
-            accept_multiple_files=True
+            "Choose files", type=["csv", "xlsx", "xls"],
+            accept_multiple_files=True,
         )
-        
-        if uploaded_files and st.button("🚀 Load Files"):
+        if uploaded_files and st.button("🚀 Load as nielsen_pos"):
+            db_path = settings.database_uri.replace("sqlite:///", "")
+            loader = DataLoader(db_path=db_path)
             import tempfile
-            loader = DataLoader(db_path="./data/database.db")
-            
-            with st.spinner("Loading files..."):
-                for uploaded_file in uploaded_files:
+            with st.spinner("Loading…"):
+                for uf in uploaded_files:
                     try:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix) as tmp_file:
-                            tmp_file.write(uploaded_file.read())
-                            stats = loader.load_file(tmp_file.name, if_exists='replace')
-                            st.success(f"✓ {stats['table_name']}: {stats['rows']} rows")
-                            Path(tmp_file.name).unlink()
+                        with tempfile.NamedTemporaryFile(
+                            delete=False, suffix=Path(uf.name).suffix
+                        ) as tmp:
+                            tmp.write(uf.read())
+                            stats = loader.load_file(
+                                tmp.name, table_name="nielsen_pos",
+                                if_exists="replace",
+                            )
+                            st.success(f"✓ {stats['rows']} rows loaded as nielsen_pos")
+                            Path(tmp.name).unlink()
                     except Exception as e:
                         st.error(f"Error: {e}")
-                db_manager.__init__()
-                st.rerun()
-    
-    st.markdown("---")
-    
-    # Stats
-    st.subheader("📊 Stats")
-    if 'query_count' not in st.session_state:
-        st.session_state['query_count'] = 0
-    st.metric("Queries Run", st.session_state['query_count'])
-
-# Main content
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    st.subheader("💬 Ask Your Question")
-    
-    # Example questions
-    st.markdown("**Example Questions:**")
-    examples = [
-        "What is the total revenue by product category?",
-        "Show me the top 5 customers by purchase amount",
-        "Calculate the month-over-month growth in sales",
-        "Which products have never been ordered?"
-    ]
-    
-    example_cols = st.columns(2)
-    for i, example in enumerate(examples):
-        with example_cols[i % 2]:
-            if st.button(example, key=f"ex_{i}"):
-                st.session_state['question'] = example
-    
-    # Question input
-    question = st.text_area(
-        "Enter your question:",
-        value=st.session_state.get('question', ''),
-        height=100,
-        key='question_input'
-    )
-    
-    col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 3])
-    
-    with col_btn1:
-        submit = st.button("🚀 Run Query", type="primary", use_container_width=True)
-    
-    with col_btn2:
-        clear = st.button("🔄 Clear", use_container_width=True)
-        if clear:
-            st.session_state['question'] = ''
+            db_manager.__class__.__init__(db_manager)
             st.rerun()
 
-with col2:
-    st.subheader("ℹ️ About")
-    st.markdown("""
-    This agent uses a multi-stage DRGC pipeline:
-    
-    1. **📋 Planner**: Decomposes the question
-    2. **🔍 Schema Linker**: Finds relevant tables
-    3. **⚙️ Generator**: Writes SQL with CoT
-    4. **✅ Critic**: Validates and self-corrects
-    
-    **Features:**
-    - Semantic caching
-    - Dynamic few-shot learning
-    - Execution-guided error correction
-    - Support for complex nested queries
-    """)
+# ─── main header ────────────────────────────────────────────────────────────────────
+st.title("📊 Nielsen Text-to-SQL Agent")
+st.caption(
+    "Multi-agent DRGC pipeline · Interaction routing · "
+    "CTE SQL · Dynamic few-shot · Streaming responses"
+)
 
-# Process query
-if submit and question:
-    st.session_state['query_count'] += 1
-    
-    with st.spinner("🤖 Agent is working..."):
-        try:
-            # Run the agent
-            result = run_agent(question)
-            
-            # Display results
-            st.markdown("---")
-            st.subheader("📊 Results")
-            
-            # Success/Error indicator
-            if result.get('error'):
-                st.error(f"❌ **Error**: {result['error']}")
-            else:
-                st.success("✅ **Query Successful**")
-            
-            # Tabs for different views
-            tab1, tab2, tab3, tab4 = st.tabs(["SQL Query", "Results", "Execution Details", "Agent Trace"])
-            
-            with tab1:
-                st.markdown("**Generated SQL:**")
-                sql = result.get('sql_query', 'N/A')
-                st.code(sql, language='sql')
-                
-                # Copy button (simulated)
-                if sql != 'N/A':
-                    st.download_button(
-                        label="📋 Copy SQL",
-                        data=sql,
-                        file_name="query.sql",
-                        mime="text/plain"
-                    )
-            
-            with tab2:
-                if result.get('error'):
-                    st.error(result['error'])
-                else:
-                    result_preview = result.get('result_preview', 'No results')
-                    st.text(result_preview)
-                    
-                    # Try to display as dataframe
-                    query_result = result.get('query_result')
-                    if query_result and isinstance(query_result, list):
-                        try:
-                            if hasattr(query_result[0], '_mapping'):
-                                df = pd.DataFrame([dict(row._mapping) for row in query_result])
-                                st.dataframe(df, use_container_width=True)
-                        except:
-                            pass
-            
-            with tab3:
-                metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
-                
-                with metrics_col1:
-                    exec_time = result.get('execution_time_ms', 0)
-                    st.metric("Execution Time", f"{exec_time:.2f}ms" if exec_time else "N/A")
-                
-                with metrics_col2:
-                    total_time = result.get('total_latency_ms', 0)
-                    st.metric("Total Latency", f"{total_time:.2f}ms" if total_time else "N/A")
-                
-                with metrics_col3:
-                    iterations = result.get('iterations', 0)
-                    st.metric("Correction Iterations", iterations)
-                
-                st.markdown("---")
-                
-                # Cache hit
-                if result.get('cache_hit'):
-                    st.info("⚡ **Cache Hit** - Result retrieved from semantic cache")
-                
-                # Selected tables
-                if show_schema and result.get('relevant_tables'):
-                    st.markdown("**Selected Tables:**")
-                    st.write(", ".join(result['relevant_tables']))
-            
-            with tab4:
-                if show_plan and result.get('plan'):
-                    st.markdown("**📋 Logical Plan:**")
-                    st.text(result['plan'])
-                    st.markdown("---")
-                
-                if show_iterations and result.get('iterations', 0) > 0:
-                    st.markdown(f"**🔄 Self-Correction:** {result['iterations']} iteration(s)")
-                    if result.get('error_type'):
-                        st.text(f"Error Type: {result['error_type']}")
-                
-                if result.get('few_shot_examples'):
-                    st.markdown("**📚 Retrieved Examples:**")
-                    st.text(f"Used {len(result['few_shot_examples'])} similar examples")
-        
-        except Exception as e:
-            st.error(f"An error occurred: {str(e)}")
-            logger.error(f"Streamlit error: {e}")
+# ─── example question pills ────────────────────────────────────────────────────────────
+EXAMPLES = [
+    "What was MONDELEZ market share in TOTAL BARS in 2024?",
+    "Compare OREO brand sales in December 2023 vs March 2024",
+    "What is the TDP for MDLZ SINGLES PPG in 2024?",
+    "How did sales perform YTD vs YTD last year?",
+]
 
-# Custom example form
-if st.session_state.get('show_example_form', False):
-    st.markdown("---")
-    st.subheader("➕ Add Custom Example")
-    
-    with st.form("example_form"):
-        ex_question = st.text_input("Question")
-        ex_sql = st.text_area("SQL", height=150)
-        ex_complexity = st.selectbox("Complexity", ["simple", "medium", "complex"])
-        
-        col1, col2 = st.columns([1, 4])
-        with col1:
-            submit_ex = st.form_submit_button("Add")
-        with col2:
-            cancel_ex = st.form_submit_button("Cancel")
-        
-        if submit_ex and ex_question and ex_sql:
-            few_shot_retriever.add_example(
-                question=ex_question,
-                sql=ex_sql,
-                complexity=ex_complexity
-            )
-            st.success("Example added!")
-            st.session_state['show_example_form'] = False
-            st.rerun()
-        
-        if cancel_ex:
-            st.session_state['show_example_form'] = False
-            st.rerun()
+st.markdown("**Try an example:**")
+ex_cols = st.columns(len(EXAMPLES))
+for i, ex in enumerate(EXAMPLES):
+    if ex_cols[i].button(ex, key=f"ex_{i}", use_container_width=True):
+        st.session_state["prefill"] = ex
+        st.rerun()
 
-# Footer
 st.markdown("---")
-st.markdown("<div style='text-align: center; color: gray;'><small>Multi-Agent Text-to-SQL System powered by LangGraph & Groq</small></div>", unsafe_allow_html=True)
+
+# ─── render chat history ────────────────────────────────────────────────────────────
+for idx, turn in enumerate(st.session_state.chat_history):
+    with st.chat_message("user"):
+        st.markdown(turn["question"])
+    with st.chat_message("assistant"):
+        st.markdown(turn.get("nl_response", "*(no response)*"))
+        _render_turn({**turn, "idx": idx})
+
+# ─── intent badge map ────────────────────────────────────────────────────────────────
+INTENT_BADGES = {
+    "data_query":    "🔍 Data question",
+    "follow_up":     "🔗 Follow-up question",
+    "smalltalk":     "💬 Conversation",
+    "clarification": "❓ Needs clarification",
+    "out_of_scope":  "🚫 Out of scope",
+}
+
+# ─── chat input ──────────────────────────────────────────────────────────────────
+prefill  = st.session_state.pop("prefill", None)
+prompt   = st.chat_input("Ask a question about Nielsen POS data…", key="chat_input")
+question = prompt or prefill
+
+if question:
+    # 1. Show user message immediately
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    st.session_state.query_count += 1
+    conversation_history = _history_for_agent()
+    final_state: dict   = {}
+    detected_intent: str = "data_query"   # will be updated when interaction step fires
+
+    # 2. Step-by-step agent thinking
+    with st.chat_message("assistant"):
+        with st.status("🤖 Agent is thinking…", expanded=True) as status:
+            step_placeholder = st.empty()
+
+            for event in stream_agent_steps(question, conversation_history):
+                if event["type"] == "step":
+                    node  = event["node"]
+                    label = event["label"]
+                    out   = event.get("output", {})
+
+                    # ---- Interaction node: classify intent ----
+                    if node == "interaction":
+                        detected_intent = out.get("intent", "data_query")
+                        badge = INTENT_BADGES.get(detected_intent, detected_intent)
+                        step_placeholder.markdown(f"**{label}** — {badge}")
+                        if detected_intent not in DATA_INTENTS:
+                            # Non-data path is very fast — collapse immediately
+                            status.update(label=badge, state="complete", expanded=False)
+                        continue
+
+                    # ---- For non-data intents, skip showing SQL steps ----
+                    if detected_intent not in DATA_INTENTS:
+                        continue
+
+                    # ---- Data path: show progress ----
+                    if node == "check_cache" and out.get("cache_hit"):
+                        step_placeholder.success("⚡ Cache hit — returning cached result")
+                    else:
+                        step_placeholder.markdown(f"**{label}**")
+
+                    if node == "planner" and out.get("plan"):
+                        with st.expander("📋 Query Plan", expanded=False):
+                            st.text(out["plan"])
+                    elif node == "schema_retriever" and out.get("schema_metadata"):
+                        cols = list(out["schema_metadata"].keys())
+                        st.caption(f"Selected columns: {cols}")
+                    elif node == "generator" and out.get("sql_query"):
+                        with st.expander("🗃 Generated SQL", expanded=False):
+                            st.code(out["sql_query"], language="sql")
+                    elif node == "executor":
+                        if out.get("error"):
+                            st.warning(f"Execution error — will retry: `{out['error']}`")
+                        else:
+                            st.success("✅ SQL executed successfully")
+                    elif node == "reflector":
+                        st.warning("🔄 Correcting SQL…")
+
+                elif event["type"] == "final":
+                    final_state = event["state"]
+
+            # Update status label for data path
+            if detected_intent in DATA_INTENTS:
+                if final_state.get("error"):
+                    status.update(label="⚠️ Completed with errors", state="error", expanded=False)
+                else:
+                    status.update(label="✅ Done!", state="complete", expanded=False)
+
+        # 3. Response rendering
+        is_data = detected_intent in DATA_INTENTS
+
+        if is_data:
+            # Stream the NL answer token-by-token for data results
+            nl_answer = st.write_stream(
+                stream_nl_response(final_state, conversation_history)
+            )
+        else:
+            # Direct responses are already computed by the interaction/direct_respond nodes
+            nl_answer = (
+                final_state.get("nl_response")
+                or final_state.get("direct_response")
+                or ""
+            )
+            st.markdown(nl_answer)
+
+        # 4. Details tabs (shown only for data intents)
+        df = _rows_to_df(final_state.get("query_result")) if is_data else None
+        turn = {
+            "question":       question,
+            "nl_response":    nl_answer,
+            "intent":         detected_intent,
+            "sql":            final_state.get("sql_query") if is_data else None,
+            "df":             df,
+            "plan":           final_state.get("plan"),
+            "error":          final_state.get("error"),
+            "iterations":     final_state.get("iterations", 0),
+            "exec_time":      final_state.get("execution_time_ms"),
+            "total_time":     final_state.get("total_latency_ms"),
+            "cache_hit":      final_state.get("cache_hit", False),
+            "few_shot_count": len(final_state.get("few_shot_examples") or []),
+        }
+        _render_turn({**turn, "idx": len(st.session_state.chat_history)}, expanded=is_data)
+
+    # 5. Persist to history
+    st.session_state.chat_history.append(turn)
+
+# ─── custom example form ───────────────────────────────────────────────────────────────────
+if st.session_state.show_example_form:
+    st.markdown("---")
+    st.subheader("➕ Add Custom Few-Shot Example")
+    with st.form("example_form"):
+        ex_q   = st.text_input("Natural language question")
+        ex_sql = st.text_area("SQL (CTE preferred)", height=150)
+        c1, c2 = st.columns([1, 4])
+        submitted = c1.form_submit_button("Add")
+        cancelled = c2.form_submit_button("Cancel")
+
+        if submitted and ex_q and ex_sql:
+            few_shot_retriever.add_example(
+                question=ex_q, sql=ex_sql, complexity="domain-specific"
+            )
+            st.success("Example added to vector store!")
+            st.session_state.show_example_form = False
+            st.rerun()
+        if cancelled:
+            st.session_state.show_example_form = False
+            st.rerun()
+
+# ─── footer ─────────────────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.caption(
+    "Nielsen Text-to-SQL · LangGraph DRGC + Interaction Router "
+    "· Groq LLM · ChromaDB few-shot · SQLite"
+)

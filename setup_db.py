@@ -56,6 +56,13 @@ Examples:
     )
     
     parser.add_argument(
+        '--table-name',
+        '-t',
+        default='nielsen_pos',
+        help='Explicit table name for the loaded data (default: nielsen_pos)'
+    )
+
+    parser.add_argument(
         '--show-info',
         action='store_true',
         help='Show database information after loading'
@@ -69,7 +76,8 @@ Examples:
         result = setup_database_from_files(
             source_path=args.source,
             db_path=args.db,
-            if_exists=args.mode
+            if_exists=args.mode,
+            table_name=args.table_name
         )
         
         # Show summary
