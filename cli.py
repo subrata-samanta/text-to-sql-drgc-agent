@@ -396,14 +396,21 @@ def run_question(
                 needs_clarify = output.get("needs_clarification", False)
                 corrected = [e for e in log if e.get("action") == "corrected"]
                 unchanged = [e for e in log if e.get("action") == "unchanged"]
-                n_clarify  = sum(1 for e in log if e.get("action") == "clarify")
+                clarify_items = [e for e in log if e.get("action") == "clarify"]
                 rows = []
                 for e in corrected:
                     rows.append((f"  ✏", f"{e['column']}: '{e['sql_value']}' → '{e['db_match']}' ({e['confidence']:.0%})"))
                 for e in unchanged:
                     rows.append((f"  ✓", f"{e['column']}: '{e['sql_value']}' (exact match)"))
-                if n_clarify:
-                    rows.append(("  ⚠", f"{n_clarify} filter(s) need clarification"))
+                # Show each unresolved filter as an explicit clarification question
+                for e in clarify_items:
+                    rows.append((f"  ⚠", f"{e['column']}: '{e['sql_value']}' — no confident match found"))
+                # Show the full clarification question that will be asked
+                clarif_text = output.get("direct_response", "")
+                if clarif_text:
+                    for line in clarif_text.splitlines():
+                        if line.strip():
+                            rows.append(("  →", line.strip()))
                 if not rows:
                     rows = [("Status", "No string filters found to verify")]
                 badge = "⚠ NEEDS CLARIFICATION" if needs_clarify else (

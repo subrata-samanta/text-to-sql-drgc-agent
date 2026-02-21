@@ -526,13 +526,19 @@ def stream_nl_response(
     nl_response is already pre-computed by direct_respond_node — yield it
     directly without calling the LLM again.
     """
-    # Short-circuit: direct response already computed (non-data intents)
-    intent = state.get("intent", "data_query")
-    if intent not in DATA_INTENTS:
-        prebuilt = state.get("nl_response") or state.get("direct_response") or ""
-        if prebuilt:
-            yield prebuilt
-            return
+    # Short-circuit 1: nl_response already pre-computed
+    # This covers:
+    #  - Non-data intents (smalltalk / clarification / out_of_scope)
+    #  - Filter-value clarification mid-data-pipeline (needs_clarification=True)
+    prebuilt = state.get("nl_response") or state.get("direct_response") or ""
+    if prebuilt:
+        yield prebuilt
+        return
+
+    # Short-circuit 2: data intent but explicitly flagged as clarification
+    if state.get("needs_clarification"):
+        yield state.get("direct_response") or "I need more information before I can run this query."
+        return
 
     from agents.responder import NLResponderAgent
     agent = NLResponderAgent()
