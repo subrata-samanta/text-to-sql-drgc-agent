@@ -28,7 +28,9 @@ class Settings(BaseSettings):
     embedding_model: str = Field(default="all-MiniLM-L6-v2", env="EMBEDDING_MODEL")
     
     # Caching Configuration (Disk Cache)
-    enable_semantic_cache: bool = Field(default=True, env="ENABLE_SEMANTIC_CACHE")
+    # Off by default — enable at runtime via the UI toggle, --cache CLI flag,
+    # or by setting ENABLE_SEMANTIC_CACHE=true in .env
+    enable_semantic_cache: bool = Field(default=False, env="ENABLE_SEMANTIC_CACHE")
     cache_similarity_threshold: float = Field(default=0.95, env="CACHE_SIMILARITY_THRESHOLD")
     
     # Agent Configuration

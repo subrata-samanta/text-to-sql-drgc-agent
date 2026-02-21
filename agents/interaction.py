@@ -31,14 +31,15 @@ from core.state import AgentState
 from config import settings
 
 # ── Intent vocabulary ─────────────────────────────────────────────────────────
-INTENT_DATA      = "data_query"    # Needs full SQL pipeline
-INTENT_FOLLOWUP  = "follow_up"     # Data question referencing a prior turn
-INTENT_CHAT      = "smalltalk"     # Greetings / pleasantries / meta-questions
-INTENT_VAGUE     = "clarification" # Too vague — missing dimension / filter
-INTENT_OOS       = "out_of_scope"  # Nothing to do with Nielsen POS
+INTENT_DATA       = "data_query"    # Needs full SQL pipeline
+INTENT_FOLLOWUP   = "follow_up"     # Data question referencing a prior turn
+INTENT_CORRECTION = "correction"    # User says prev answer was wrong; needs regen
+INTENT_CHAT       = "smalltalk"     # Greetings / pleasantries / meta-questions
+INTENT_VAGUE      = "clarification" # Too vague — missing dimension / filter
+INTENT_OOS        = "out_of_scope"  # Nothing to do with Nielsen POS
 
 #: Intents that must be routed to the SQL pipeline
-DATA_INTENTS: set[str] = {INTENT_DATA, INTENT_FOLLOWUP}
+DATA_INTENTS: set[str] = {INTENT_DATA, INTENT_FOLLOWUP, INTENT_CORRECTION}
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 _SYSTEM = """\
@@ -157,16 +158,20 @@ class InteractionAgent:
             intent    = payload.get("intent", INTENT_DATA)
             rewritten = (payload.get("rewritten_question") or question).strip()
             direct    = payload.get("direct_response", "")
+            feedback  = payload.get("feedback_summary", "").strip()
             conf      = float(payload.get("confidence", 0.9))
 
             logger.info(f"INTERACTION: intent={intent}  confidence={conf:.2f}")
             if intent == INTENT_FOLLOWUP:
                 logger.info(f"INTERACTION: rewritten → '{rewritten}'")
+            if intent == INTENT_CORRECTION:
+                logger.info(f"INTERACTION: correction feedback → '{feedback}'")
 
             return {
                 "intent": intent,
                 "confidence": conf,
                 "rewritten_question": rewritten,
+                "feedback_summary": feedback,
                 "direct_response": direct,
             }
 
@@ -176,11 +181,59 @@ class InteractionAgent:
                 "intent": INTENT_DATA,
                 "confidence": 0.5,
                 "rewritten_question": question,
+                "feedback_summary": "",
                 "direct_response": "",
             }
 
 
 # ── LangGraph node ────────────────────────────────────────────────────────────
+
+def _build_filter_correction(
+    question: str,
+    history: List[Dict],
+) -> Optional[dict]:
+    """
+    If the last history turn contains a pending_filter_clarification, the user
+    is answering our clarification question.  Build a correction update directly
+    — no LLM classification needed.
+
+    Returns a state-update dict (same shape as interaction_node's return) or
+    None if this is not a filter-clarification response.
+    """
+    if not history:
+        return None
+    last = history[-1]
+    pending = last.get("filter_clarification")  # list of {column, sql_value, …}
+    draft_sql = last.get("sql")
+    if not pending or not draft_sql:
+        return None
+
+    # Build an explicit user_feedback string describing each filter that needs fixing.
+    # The user's raw answer (question) is the authoritative source for the new values.
+    col_list = ", ".join(
+        f"'{p['column']}'='{p['sql_value']}'" for p in pending
+    )
+    feedback = (
+        f"Filter clarification response — the user answered: \"{question}\". "
+        f"The following filter(s) could not be automatically matched and need "
+        f"to be corrected using the user's answer: {col_list}. "
+        f"Replace each unresolved filter value in the SQL with the value the "
+        f"user just specified. If the answer implies a specific column value, "
+        f"use it; otherwise keep the closest match."
+    )
+
+    logger.info(
+        f"INTERACTION: detected filter-clarification response "
+        f"(columns: {col_list}) — shortcutting to correction intent"
+    )
+
+    return {
+        "intent":          INTENT_CORRECTION,
+        "direct_response": "",
+        "user_feedback":   feedback,
+        "previous_sql":    draft_sql,
+    }
+
 
 def interaction_node(state: AgentState) -> dict:
     """
@@ -190,14 +243,26 @@ def interaction_node(state: AgentState) -> dict:
         intent            — routing key used by should_route()
         direct_response   — ready-made reply for non-SQL paths
         question          — replaced with self-contained rewrite for follow-ups
+        user_feedback     — correction summary (correction intent only)
+        previous_sql      — SQL from the prior turn being corrected
     """
     agent   = InteractionAgent()
     history = state.get("conversation_history") or []
+
+    # ── Fast-path: answering a filter clarification ───────────────────────
+    # If the previous turn asked "which brand did you mean?", the user's reply
+    # is deterministically a correction — skip LLM classification entirely.
+    fc_update = _build_filter_correction(state["question"], history)
+    if fc_update is not None:
+        return fc_update
+
     result  = agent.classify(state["question"], history)
 
     updates: dict = {
         "intent":          result["intent"],
         "direct_response": result.get("direct_response", ""),
+        "user_feedback":   None,
+        "previous_sql":    None,
     }
 
     # Overwrite question with fully self-contained rewrite for follow-ups
@@ -205,5 +270,23 @@ def interaction_node(state: AgentState) -> dict:
         rewritten = result.get("rewritten_question", "").strip()
         if rewritten and rewritten != state["question"]:
             updates["question"] = rewritten
+
+    # For corrections: capture feedback + the SQL that was wrong
+    elif result["intent"] == INTENT_CORRECTION:
+        raw_feedback = result.get("feedback_summary", "").strip()
+        user_msg     = state["question"]
+        # Combine LLM-extracted summary with the raw user message
+        updates["user_feedback"] = (
+            f"{raw_feedback} | User said: {user_msg}" if raw_feedback else user_msg
+        )
+        # Pull the most-recent SQL from conversation history
+        for h in reversed(history):
+            if h.get("sql"):
+                updates["previous_sql"] = h["sql"]
+                break
+        logger.info(
+            f"CORRECTION: feedback='{updates['user_feedback']}' "
+            f"prev_sql={'yes' if updates['previous_sql'] else 'not found'}"
+        )
 
     return updates

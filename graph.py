@@ -14,6 +14,7 @@ from agents import (
     planner_node,
     schema_linker_node,
     generator_node,
+    filter_resolver_node,
     executor_node,
     reflector_node,
     responder_node,
@@ -34,6 +35,7 @@ NODE_LABELS: Dict[str, str] = {
     "retrieve_few_shot":"📚  Retrieving few-shot examples",
     "schema_retriever": "🔍  Linking Nielsen schema columns",
     "generator":        "⚙️  Generating SQL (CTE)",
+    "filter_resolver":  "🔎  Verifying filter values against DB",
     "sql_validator":    "✅  Validating SQL correctness",
     "executor":         "▶️  Executing SQL",
     "reflector":        "🔄  Self-correcting SQL",
@@ -92,10 +94,18 @@ def check_cache_node(state: AgentState) -> dict:
     """
     Checks if we have a cached result for this question.
     Uses semantic similarity to find matching previous queries.
+    Cache is always bypassed when the user has provided correction feedback
+    (we must regenerate, not return the same wrong answer).
     """
     question = state["question"]
+
+    # Never serve cache for correction requests
+    if state.get("user_feedback"):
+        logger.info("Cache bypassed — correction mode active")
+        return {"cache_hit": False}
+
     cached = semantic_cache.get(question)
-    
+
     if cached:
         logger.info("✓ Using cached result")
         return {
@@ -166,6 +176,12 @@ def should_validate_result(
         logger.info("Bypassing cache and re-planning...")
         return "bypass_cache"
 
+    # If the generator itself failed (set should_retry=False), there is no SQL
+    # to improve by regenerating.  Skip the retry loop and surface the error.
+    if not state.get("should_retry", True):
+        logger.warning("Generator failed with should_retry=False — skipping regeneration")
+        return "force_execute"
+
     if attempts < MAX_VALIDATION_ATTEMPTS:
         logger.info(f"Regenerating SQL (attempt {attempts})...")
         return "regenerate"
@@ -186,6 +202,9 @@ def reset_cache_and_sql(state: AgentState) -> dict:
         "result_preview": None,
         "plan": None,
         "plan_steps": None,
+        "filter_log": None,
+        "needs_clarification": False,
+        "pending_filter_clarification": None,
     }
 
 
@@ -263,6 +282,7 @@ def build_graph() -> StateGraph:
     workflow.add_node("retrieve_few_shot", retrieve_few_shot_node)  # Get example queries
     workflow.add_node("schema_retriever", schema_linker_node)  # Find relevant tables
     workflow.add_node("generator", generator_node)  # Generate SQL
+    workflow.add_node("filter_resolver", filter_resolver_node)  # Verify & correct filter values
     workflow.add_node("sql_validator", validator_node)  # Validate SQL vs question
     workflow.add_node("reset_cache", reset_cache_and_sql)  # Clear stale cache state
     workflow.add_node("executor", executor_node)  # Execute and validate
@@ -304,8 +324,19 @@ def build_graph() -> StateGraph:
     workflow.add_edge("retrieve_few_shot", "schema_retriever")
     workflow.add_edge("schema_retriever", "generator")
 
-    # Fresh SQL also goes through the validator
-    workflow.add_edge("generator", "sql_validator")
+    # After generation, resolve filter values against real DB values
+    workflow.add_edge("generator", "filter_resolver")
+
+    # After filter resolution: if clarification needed route to direct_respond,
+    # otherwise proceed to validation
+    workflow.add_conditional_edges(
+        "filter_resolver",
+        lambda s: "clarify" if s.get("needs_clarification") else "validate",
+        {
+            "clarify":  "direct_respond",
+            "validate": "sql_validator",
+        }
+    )
 
     # Validator routing
     workflow.add_conditional_edges(
@@ -397,6 +428,14 @@ def _make_initial_state(
         "validation_passed": None,
         "validation_issues": [],
         "sql_validation_attempts": 0,
+        # Feedback / correction
+        "user_feedback": None,
+        "previous_sql":  None,
+        "entity_column_map": None,
+        # Filter value resolution
+        "filter_log": None,
+        "needs_clarification": False,
+        "pending_filter_clarification": None,
     }
 
 

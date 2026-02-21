@@ -17,30 +17,41 @@ class SemanticCache:
     """
     Semantic cache that stores query results indexed by question embeddings.
     Uses cosine similarity to match semantically similar questions.
+
+    The backend (disk cache + embedding model) is initialised lazily on first
+    use so that keeping the cache *disabled* by default has zero startup cost.
+    Enable at runtime via the UI toggle, --cache CLI flag, or ENABLE_SEMANTIC_CACHE=true.
     """
-    
+
     def __init__(self):
-        self.enabled = settings.enable_semantic_cache
         self.threshold = settings.cache_similarity_threshold
-        
-        if not self.enabled:
-            logger.info("Semantic cache disabled")
-            return
-        
-        # Initialize disk cache
-        self.cache = Cache("./cache/semantic_cache")
-        
-        # Initialize embedding model with HuggingFace (local)
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=settings.embedding_model
-        )
-        
-        logger.info(f"Semantic cache initialized (threshold: {self.threshold})")
+        self._cache: Optional[Cache] = None       # lazy
+        self._embeddings = None                    # lazy
+        if settings.enable_semantic_cache:
+            self._init_backend()
+        else:
+            logger.info("Semantic cache disabled (off by default; enable via UI or --cache)")
+
+    # ------------------------------------------------------------------
+    def _init_backend(self) -> None:
+        """Initialise the disk cache + embedding model (idempotent)."""
+        if self._cache is not None:
+            return  # already up
+        try:
+            self._cache = Cache("./cache/semantic_cache")
+            self._embeddings = HuggingFaceEmbeddings(
+                model_name=settings.embedding_model
+            )
+            logger.info(f"Semantic cache backend ready (threshold: {self.threshold})")
+        except Exception as exc:
+            logger.error(f"Semantic cache init failed: {exc}")
+            self._cache = None
+            self._embeddings = None
     
-    def _compute_embedding(self, text: str) -> np.ndarray:
+    def _compute_embedding(self, text: str) -> Optional[np.ndarray]:
         """Compute embedding vector for text."""
         try:
-            embedding = self.embeddings.embed_query(text)
+            embedding = self._embeddings.embed_query(text)
             return np.array(embedding)
         except Exception as e:
             logger.error(f"Embedding error: {e}")
@@ -60,46 +71,40 @@ class SemanticCache:
     def get(self, question: str) -> Optional[dict]:
         """
         Retrieve cached result for a question.
-        
-        Args:
-            question: User's question
-            
-        Returns:
-            Cached result dict or None if no match
+        Checks settings.enable_semantic_cache at call-time so a runtime
+        toggle takes effect immediately without restarting.
         """
-        if not self.enabled:
+        if not settings.enable_semantic_cache:
             return None
-        
+        if self._cache is None:
+            self._init_backend()
+        if self._cache is None:          # init failed
+            return None
+
         try:
-            # Compute embedding for question
             query_embedding = self._compute_embedding(question)
             if query_embedding is None:
                 return None
-            
-            # Get all cached items
-            # In production, use a vector database (ChromaDB, Pinecone, etc.)
-            # For simplicity, we iterate through cache
+
             best_match = None
             best_similarity = 0.0
-            
-            for key in self.cache:
+
+            for key in self._cache:
                 if key.startswith("embedding_"):
-                    cached_data = self.cache[key]
+                    cached_data = self._cache[key]
                     cached_embedding = np.array(cached_data["embedding"])
-                    
                     similarity = self._cosine_similarity(query_embedding, cached_embedding)
-                    
                     if similarity > best_similarity and similarity >= self.threshold:
                         best_similarity = similarity
                         best_match = cached_data
-            
+
             if best_match:
                 logger.info(f"✓ Cache HIT (similarity: {best_similarity:.3f})")
                 return best_match["result"]
             else:
                 logger.info("✗ Cache MISS")
                 return None
-                
+
         except Exception as e:
             logger.error(f"Cache retrieval error: {e}")
             return None
@@ -107,40 +112,36 @@ class SemanticCache:
     def set(self, question: str, result: dict):
         """
         Store query result in cache.
-        
-        Args:
-            question: User's question
-            result: Result dict to cache
+        Checks settings.enable_semantic_cache at call-time.
         """
-        if not self.enabled:
+        if not settings.enable_semantic_cache:
             return
-        
+        if self._cache is None:
+            self._init_backend()
+        if self._cache is None:          # init failed
+            return
+
         try:
-            # Compute embedding
             embedding = self._compute_embedding(question)
             if embedding is None:
                 return
-            
-            # Create cache key
+
             key = f"embedding_{hashlib.md5(question.encode()).hexdigest()}"
-            
-            # Store with embedding
             cache_data = {
-                "question": question,
+                "question":  question,
                 "embedding": embedding.tolist(),
-                "result": result
+                "result":    result,
             }
-            
-            self.cache[key] = cache_data
-            logger.info(f"✓ Cached result for question")
-            
+            self._cache[key] = cache_data
+            logger.info("✓ Cached result for question")
+
         except Exception as e:
             logger.error(f"Cache storage error: {e}")
     
     def clear(self):
         """Clear all cached items."""
-        if self.enabled:
-            self.cache.clear()
+        if self._cache is not None:
+            self._cache.clear()
             logger.info("Cache cleared")
 
 

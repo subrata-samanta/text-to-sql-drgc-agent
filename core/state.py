@@ -54,13 +54,29 @@ class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], operator.add]
 
     # Intent classification (set by InteractionAgent — first node)
-    intent: Optional[str]          # data_query | follow_up | smalltalk | clarification | out_of_scope
+    intent: Optional[str]          # data_query | follow_up | correction | smalltalk | clarification | out_of_scope
     direct_response: Optional[str] # Pre-built reply for non-data intents (skips SQL pipeline)
+
+    # User feedback / correction (set when intent == "correction")
+    user_feedback: Optional[str]   # What the user says was wrong / how to fix it
+    previous_sql: Optional[str]    # The SQL from the prior turn being corrected
 
     # SQL Validation (set by SQLValidatorAgent)
     validation_passed: Optional[bool]       # True = SQL is semantically correct
     validation_issues: Optional[List[str]]  # Human-readable list of problems found
     sql_validation_attempts: Optional[int]  # Guard against infinite validation loops
+    # Entity→column map resolved from question (hierarchy-priority order):
+    # e.g. {"MONDELEZ": "manufacturer", "TOTAL BARS": "sub_category"}
+    # Populated by the validator; used by the generator on retry to pick
+    # the right column for each named entity.
+    entity_column_map: Optional[Dict[str, str]]
+
+    # Filter value resolution (set by FilterResolverAgent after generation)
+    filter_log: Optional[List[Dict[str, Any]]]  # Per-filter resolution log
+    needs_clarification: Optional[bool]         # True when LLM can't find a confident match
+    # Pending filter clarification details (carried in history so next turn can auto-correct)
+    # Each entry: {column, sql_value, db_match, clarification_q}
+    pending_filter_clarification: Optional[List[Dict[str, Any]]]
 
     # Metadata
     start_time: Optional[float]  # For latency tracking

@@ -3,43 +3,33 @@ SQL Generator Agent: Translates logical plans into SQL queries.
 """
 
 from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate, FewShotChatMessagePromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from loguru import logger
 from core.state import AgentState
 from config import settings
 
 
-class SQLGeneratorAgent:
-    """
-    Translates logical plans into valid SQL queries using Chain-of-Thought reasoning.
-    """
-    
-    def __init__(self):
-        self.llm = ChatGroq(
-            model=settings.groq_model_reasoning,
-            temperature=settings.groq_temperature,
-            groq_api_key=settings.groq_api_key
-        )
-        
-        # System prompt with Chain-of-Thought guidance
-        self.system_prompt = """You are an expert SQL engineer. Write correct, efficient SQL queries.
+_BASE_SYSTEM = """\
+You are an expert SQL engineer for a Nielsen retail analytics platform.
+Your job is to write correct, efficient SQL that faithfully implements the
+business logic of this organisation.
 
-CRITICAL RULES:
-1. Use ONLY the provided schema - Never hallucinate table or column names
-2. Follow the logical plan exactly - Each plan step should map to SQL logic
-3. Think before coding - Explain your approach first (Chain-of-Thought)
-4. Be dialect-aware - Adjust syntax for the target database
-5. Return ONLY the SQL - No markdown formatting, no extra text
+════════════════════════════════════════════════════════════════════════
+PRIORITY ORDER  (follow from highest to lowest)
+════════════════════════════════════════════════════════════════════════
+  1. FEW-SHOT EXAMPLES  — these encode REAL business logic and must be
+     replicated as closely as possible.  SQL patterns, CTE structure,
+     metric formulas, and filter logic shown in the examples ARE the
+     ground truth.  Any deviation requires explicit justification.
+  2. SCHEMA & CTE RULES — use only the columns and table in the schema;
+     obey every mandatory SQL rule listed there.
+  3. LOGICAL PLAN — translate the plan into SQL, but never override the
+     business logic patterns established in the examples.
+  4. USER QUESTION — the ultimate goal; resolve ambiguity using the
+     examples as reference.
+════════════════════════════════════════════════════════════════════════
 
-Chain-of-Thought Process:
-Before writing SQL, briefly explain:
-- What tables will you join and how?
-- What filters will you apply?
-- What aggregations are needed?
-- What is the logical flow?
-
-Then write the SQL with inline comments.
-
+{few_shot_block}\
 SCHEMA:
 {schema_context}
 
@@ -49,92 +39,120 @@ LOGICAL PLAN:
 USER QUESTION:
 {question}
 
-Now think through the solution, then write the SQL:"""
-        
+INSTRUCTIONS:
+- IF examples were provided above, replicate their CTE structure, metric
+  definitions, and filter logic.  Treat them as templates, not hints.
+- Return ONLY executable SQL — no markdown fences, no prose explanation.
+- Think step by step (Chain-of-Thought) before writing the final query,
+  but strip the reasoning from your final answer.
+"""
+
+_FEW_SHOT_HEADER = """\
+════════════════════════════════════════════════════════════════════════
+MANDATORY BUSINESS-LOGIC EXAMPLES  (highest priority — follow exactly)
+════════════════════════════════════════════════════════════════════════
+The SQL patterns below were written by business analysts and encode the
+EXACT formulas, filters, and CTE conventions required.  Study each
+example carefully before writing your query.
+
+{examples}
+════════════════════════════════════════════════════════════════════════
+
+"""
+
+
+def _build_few_shot_block(examples: list) -> str:
+    """Render few-shot examples as an inline system-prompt section."""
+    if not examples:
+        return ""
+    parts = []
+    for i, ex in enumerate(examples, 1):
+        q   = ex.get("question", "").strip()
+        sql = ex.get("sql", "").strip()
+        parts.append(f"Example {i}:\n  Question: {q}\n  SQL:\n{sql}\n")
+    rendered = "\n".join(parts)
+    return _FEW_SHOT_HEADER.format(examples=rendered)
+
+
+class SQLGeneratorAgent:
+    """
+    Translates logical plans into valid SQL queries using Chain-of-Thought reasoning.
+    Gives the highest priority to few-shot business-logic examples by embedding
+    them directly inside the system prompt.
+    """
+
+    def __init__(self):
+        self.llm = ChatGroq(
+            model=settings.groq_model_reasoning,
+            temperature=settings.groq_temperature,
+            groq_api_key=settings.groq_api_key
+        )
+
         self.generation_prompt = ChatPromptTemplate.from_messages([
-            ("system", self.system_prompt),
-            ("user", "Generate the SQL query:")
+            ("system", _BASE_SYSTEM),
+            ("user", "Write the SQL query now:"),
         ])
     
     def generate(self, state: AgentState, few_shot_examples=None) -> dict:
         """
         Generate SQL query from plan and schema.
-        
-        Args:
-            state: Current agent state
-            few_shot_examples: Optional list of example queries for few-shot learning
-            
-        Returns:
-            Updated state with generated SQL
+        Few-shot examples are embedded at the TOP of the system prompt so the
+        LLM treats them as the highest-priority business-logic reference.
         """
         logger.info("SQL GENERATOR: Creating SQL query from plan")
-        
-        question = state["question"]
-        plan = state.get("plan", "")
+
+        question      = state["question"]
+        plan          = state.get("plan", "")
         schema_context = state.get("schema_context", "")
-        
+
         if not schema_context:
             logger.error("No schema context available")
             return {
                 "error": "Cannot generate SQL without schema context",
                 "should_retry": False
             }
-        
+
+        # Build the few-shot block (empty string if no examples)
+        use_examples = (
+            few_shot_examples
+            and settings.enable_dynamic_few_shot
+        )
+        few_shot_block = _build_few_shot_block(few_shot_examples) if use_examples else ""
+
+        if use_examples:
+            logger.info(
+                f"SQL GENERATOR: Injecting {len(few_shot_examples)} "
+                "few-shot example(s) into system prompt (highest priority)"
+            )
+        else:
+            logger.info("SQL GENERATOR: No few-shot examples available — using schema + plan only")
+
         try:
-            # Build prompt with or without few-shot examples
-            if few_shot_examples and settings.enable_dynamic_few_shot:
-                # Create few-shot prompt with examples
-                examples = [
-                    {"question": ex.get("question", ""), "sql": ex.get("sql", "")}
-                    for ex in few_shot_examples
-                ]
-                
-                example_prompt = ChatPromptTemplate.from_messages([
-                    ("human", "{question}"),
-                    ("ai", "{sql}")
-                ])
-                
-                few_shot_prompt = FewShotChatMessagePromptTemplate(
-                    example_prompt=example_prompt,
-                    examples=examples
-                )
-                
-                # Combine with main prompt
-                full_prompt = ChatPromptTemplate.from_messages([
-                    ("system", self.system_prompt),
-                    few_shot_prompt,
-                    ("user", "Generate the SQL query:")
-                ])
-                
-                chain = full_prompt | self.llm
-            else:
-                chain = self.generation_prompt | self.llm
-            
-            # Generate SQL
+            chain = self.generation_prompt | self.llm
+
             response = chain.invoke({
-                "question": question,
-                "plan": plan,
-                "schema_context": schema_context
+                "question":       question,
+                "plan":           plan,
+                "schema_context": schema_context,
+                "few_shot_block": few_shot_block,
             })
-            
-            # Clean the SQL output
+
             sql = self._clean_sql(response.content)
-            
             logger.info(f"Generated SQL ({len(sql)} characters)")
             logger.debug(f"SQL: {sql}")
-            
+
             return {
-                "sql_query": sql,
-                "sql_explanation": response.content  # Keep full response with reasoning
+                "sql_query":       sql,
+                "sql_explanation": response.content,
             }
-            
+
         except Exception as e:
             logger.error(f"SQL generation error: {e}")
             return {
                 "error": f"SQL generation failed: {str(e)}",
                 "should_retry": False
             }
-    
+
     def _clean_sql(self, raw_sql: str) -> str:
         """
         Clean SQL output from LLM response.

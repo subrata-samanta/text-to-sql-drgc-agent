@@ -27,6 +27,8 @@ if "query_count" not in st.session_state:
     st.session_state.query_count = 0
 if "show_example_form" not in st.session_state:
     st.session_state.show_example_form = False
+if "show_correction_input" not in st.session_state:
+    st.session_state.show_correction_input = False
 
 # ─── helpers ──────────────────────────────────────────────────────────────────────
 
@@ -54,9 +56,16 @@ def _rows_to_df(query_result):
 
 
 def _history_for_agent():
-    """Return minimal history list for the agent (question + nl_response only)."""
+    """Return minimal history list for the agent (question + nl_response + sql)."""
     return [
-        {"question": t["question"], "nl_response": t["nl_response"]}
+        {
+            "question":              t["question"],
+            "nl_response":           t["nl_response"],
+            "sql":                   t.get("sql"),
+            # Carry filter clarification context so interaction_node can
+            # auto-route the user's answer to the correction pipeline.
+            "filter_clarification":  t.get("filter_clarification"),
+        }
         for t in st.session_state.chat_history
         if t.get("nl_response")
     ]
@@ -135,7 +144,20 @@ with st.sidebar:
             seed_examples()
         st.success("Examples seeded from nielsen_few_shots.yaml!")
 
-    if st.button("🗑 Clear Cache", use_container_width=True):
+    _cache_enabled = st.toggle(
+        "⚡ Semantic cache",
+        value=settings.enable_semantic_cache,
+        help="Cache SQL results for similar questions to speed up repeated queries.",
+    )
+    if _cache_enabled != settings.enable_semantic_cache:
+        settings.enable_semantic_cache = _cache_enabled
+        if _cache_enabled:
+            semantic_cache._init_backend()   # warm up lazily
+            st.success("Cache enabled!")
+        else:
+            st.info("Cache disabled for this session.")
+
+    if st.button("🗑 Clear Cache", use_container_width=True, disabled=not settings.enable_semantic_cache):
         semantic_cache.clear()
         st.success("Cache cleared!")
 
@@ -208,6 +230,7 @@ for idx, turn in enumerate(st.session_state.chat_history):
 INTENT_BADGES = {
     "data_query":    "🔍 Data question",
     "follow_up":     "🔗 Follow-up question",
+    "correction":    "🔧 Correcting answer",
     "smalltalk":     "💬 Conversation",
     "clarification": "❓ Needs clarification",
     "out_of_scope":  "🚫 Out of scope",
@@ -305,24 +328,63 @@ if question:
 
         # 4. Details tabs (shown only for data intents)
         df = _rows_to_df(final_state.get("query_result")) if is_data else None
+        # For filter-clarification turns the SQL was generated but not yet
+        # executed — store it so the next turn's interaction_node can patch it.
+        _pending_fc = final_state.get("pending_filter_clarification")
         turn = {
-            "question":       question,
-            "nl_response":    nl_answer,
-            "intent":         detected_intent,
-            "sql":            final_state.get("sql_query") if is_data else None,
-            "df":             df,
-            "plan":           final_state.get("plan"),
-            "error":          final_state.get("error"),
-            "iterations":     final_state.get("iterations", 0),
-            "exec_time":      final_state.get("execution_time_ms"),
-            "total_time":     final_state.get("total_latency_ms"),
-            "cache_hit":      final_state.get("cache_hit", False),
-            "few_shot_count": len(final_state.get("few_shot_examples") or []),
+            "question":             question,
+            "nl_response":          nl_answer,
+            "intent":               detected_intent,
+            "sql":                  (
+                final_state.get("sql_query")   # draft SQL even on clarification turns
+                if (is_data or _pending_fc)
+                else None
+            ),
+            "df":                   df,
+            "plan":                 final_state.get("plan"),
+            "error":                final_state.get("error"),
+            "iterations":           final_state.get("iterations", 0),
+            "exec_time":            final_state.get("execution_time_ms"),
+            "total_time":           final_state.get("total_latency_ms"),
+            "cache_hit":            final_state.get("cache_hit", False),
+            "few_shot_count":       len(final_state.get("few_shot_examples") or []),
+            # Carry clarification context forward for the next turn
+            "filter_clarification": _pending_fc,
         }
         _render_turn({**turn, "idx": len(st.session_state.chat_history)}, expanded=is_data)
 
     # 5. Persist to history
     st.session_state.chat_history.append(turn)
+    # Reset correction UI after every new turn
+    st.session_state.show_correction_input = False
+
+# ─── feedback widget (persists between reruns for last data turn) ─────────────
+if st.session_state.chat_history:
+    _last = st.session_state.chat_history[-1]
+    if _last.get("intent") in DATA_INTENTS and not _last.get("error"):
+        st.markdown("---")
+        _fc1, _fc2, _fc3 = st.columns([1, 1, 8])
+        if _fc1.button("👍", key="fb_up", help="Answer looks correct"):
+            st.session_state.show_correction_input = False
+        if _fc2.button("👎", key="fb_down", help="Answer is wrong — give feedback"):
+            st.session_state.show_correction_input = True
+
+        if st.session_state.show_correction_input:
+            with st.container():
+                _corr_text = st.text_input(
+                    "What was wrong? (optional)",
+                    key="correction_input",
+                    placeholder="e.g. wrong year, wrong brand, try recalculating…",
+                )
+                if st.button("Send correction ➤", key="send_correction"):
+                    _msg = (
+                        _corr_text.strip()
+                        if _corr_text.strip()
+                        else "That answer was incorrect, please try again."
+                    )
+                    st.session_state["prefill"] = _msg
+                    st.session_state.show_correction_input = False
+                    st.rerun()
 
 # ─── custom example form ───────────────────────────────────────────────────────────────────
 if st.session_state.show_example_form:
