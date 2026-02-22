@@ -62,6 +62,8 @@ def _history_for_agent():
             "question":              t["question"],
             "nl_response":           t["nl_response"],
             "sql":                   t.get("sql"),
+            # Result table text so interaction_node can detect result_lookup intent.
+            "result_preview":        t.get("result_preview"),
             # Carry filter clarification context so interaction_node can
             # auto-route the user's answer to the correction pipeline.
             "filter_clarification":  t.get("filter_clarification"),
@@ -350,6 +352,8 @@ if question:
             "few_shot_count":       len(final_state.get("few_shot_examples") or []),
             # Carry clarification context forward for the next turn
             "filter_clarification": _pending_fc,
+            # Carry result table text so next turn can answer from it
+            "result_preview":        final_state.get("result_preview"),
         }
         _render_turn({**turn, "idx": len(st.session_state.chat_history)}, expanded=is_data)
 

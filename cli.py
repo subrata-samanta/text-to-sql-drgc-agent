@@ -265,12 +265,13 @@ def _print_step_box(
 
 # INTENT badge map (plain text — no markdown)
 _INTENT_BADGES = {
-    "data_query":    "[Data question]",
-    "follow_up":     "[Follow-up]",
-    "correction":    "[Correcting]",
-    "smalltalk":     "[Conversation]",
-    "clarification": "[Clarification]",
-    "out_of_scope":  "[Out of scope]",
+    "data_query":     "[Data question]",
+    "follow_up":      "[Follow-up]",
+    "result_lookup":  "[Answered from results]",
+    "correction":     "[Correcting]",
+    "smalltalk":      "[Conversation]",
+    "clarification":  "[Clarification]",
+    "out_of_scope":   "[Out of scope]",
 }
 
 
@@ -621,6 +622,8 @@ def interactive_loop(show_steps: bool = True, stream: bool = True):
                     # turn's interaction_node can patch it via correction pipeline.
                     "sql":                  final_state.get("sql_query"),
                     "filter_clarification": final_state.get("pending_filter_clarification"),
+                    # Result table text so next turn can detect a result_lookup.
+                    "result_preview":       final_state.get("result_preview"),
                 })
                 conversation_history = conversation_history[-10:]
 

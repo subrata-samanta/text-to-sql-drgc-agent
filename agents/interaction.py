@@ -31,12 +31,13 @@ from core.state import AgentState
 from config import settings
 
 # ── Intent vocabulary ─────────────────────────────────────────────────────────
-INTENT_DATA       = "data_query"    # Needs full SQL pipeline
-INTENT_FOLLOWUP   = "follow_up"     # Data question referencing a prior turn
-INTENT_CORRECTION = "correction"    # User says prev answer was wrong; needs regen
-INTENT_CHAT       = "smalltalk"     # Greetings / pleasantries / meta-questions
-INTENT_VAGUE      = "clarification" # Too vague — missing dimension / filter
-INTENT_OOS        = "out_of_scope"  # Nothing to do with Nielsen POS
+INTENT_DATA          = "data_query"     # Needs full SQL pipeline
+INTENT_FOLLOWUP      = "follow_up"      # Data question referencing a prior turn
+INTENT_CORRECTION    = "correction"     # User says prev answer was wrong; needs regen
+INTENT_CHAT          = "smalltalk"      # Greetings / pleasantries / meta-questions
+INTENT_VAGUE         = "clarification"  # Too vague — missing dimension / filter
+INTENT_OOS           = "out_of_scope"   # Nothing to do with Nielsen POS
+INTENT_RESULT_LOOKUP = "result_lookup"  # Answerable from the previous result set — no new SQL
 
 #: Intents that must be routed to the SQL pipeline
 DATA_INTENTS: set[str] = {INTENT_DATA, INTENT_FOLLOWUP, INTENT_CORRECTION}
@@ -53,9 +54,18 @@ data_query   — A clear, answerable question about Nielsen POS data that requir
                (sales, revenue, market share, TDP, velocity, brand/category comparisons,
                 time-period analysis, YTD, growth rates, distribution, etc.)
 
-follow_up    — A data question that refers to a previous turn.
+follow_up    — A data question that refers to a previous turn but CANNOT be answered from
+               the previous result alone — it needs NEW or DIFFERENT data from the database.
                Signs: "same brand", "that market", "compare those two", "what about last year?",
                "break it down by customer", "and for OREO?", pronouns like "it" / "they" / "them".
+
+result_lookup — The question can be answered DIRECTLY from the data already returned in the
+               previous turn — no new SQL is needed.
+               Signs: asking for the min/max/rank/top/bottom item in a list that was just shown,
+               spotting a specific value in results, "which one was highest/lowest?",
+               "what was the value for X?", "how many brands were there?", "sort those",
+               "which exceeded 10%?", counting or filtering the rows already returned.
+               ONLY use this when the prior turn has actual result data (result_preview present).
 
 smalltalk    — Greetings, thanks, pleasantries, or meta-questions about the assistant.
                Examples: "hi", "hello", "thanks", "what can you do?", "how does this work?",
@@ -71,7 +81,7 @@ out_of_scope  — Questions unrelated to Nielsen / CPG / retail data.
 == Output format ==
 Respond ONLY with a valid JSON object — no markdown, no explanation:
 {{
-  "intent": "<data_query|follow_up|smalltalk|clarification|out_of_scope>",
+  "intent": "<data_query|follow_up|result_lookup|smalltalk|clarification|out_of_scope>",
   "confidence": <0.0–1.0>,
   "rewritten_question": "<if follow_up: self-contained rewrite; otherwise the original question>",
   "direct_response": "<for smalltalk/clarification/out_of_scope only — your reply to the user>"
@@ -79,12 +89,15 @@ Respond ONLY with a valid JSON object — no markdown, no explanation:
 
 == Rules ==
 - follow_up → rewrite the question fully self-contained using names from conversation history.
+- result_lookup → direct_response must be an empty string ""; the answer will be synthesised from the result data.
 - smalltalk → be warm & brief; describe 2–3 things the agent can do if relevant.
 - clarification → explain what's missing; give 1–2 concise example phrasings they could use.
 - out_of_scope → politely redirect: "I'm specialised in Nielsen POS analytics. Try asking about …"
 - data_query / follow_up → direct_response must be an empty string "".
 - When in doubt between data_query and follow_up, choose follow_up if history is non-empty and
-  the message references anything from prior turns."""
+  the message references anything from prior turns.
+- Prefer result_lookup over follow_up when the previous turn result_preview contains the data
+  needed to answer directly."""
 
 _USER = """\
 Conversation history (most recent turns):
@@ -122,7 +135,39 @@ class InteractionAgent:
             answer = (h.get("nl_response") or "")[:300]
             if answer:
                 lines.append(f"Assistant: {answer}")
+            # Include a truncated result table so the classifier can decide
+            # whether the next question is answerable from it.
+            preview = (h.get("result_preview") or "").strip()
+            if preview:
+                # Cap at 800 chars to stay within prompt budget
+                lines.append(f"[result data]\n{preview[:800]}")
         return "\n".join(lines)
+
+    def answer_from_result(
+        self,
+        question: str,
+        result_preview: str,
+        nl_response: str,
+    ) -> str:
+        """Use the LLM to answer `question` from the prior result table."""
+        prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "You are a Nielsen POS analytics assistant. "
+             "Answer the user's question using ONLY the data table shown below. "
+             "Be concise and precise. Do not run new queries or make up data."),
+            ("user",
+             "Previous assistant answer:\n{nl_response}\n\n"
+             "Data returned by the previous query:\n{preview}\n\n"
+             "User follow-up question: {question}\n\n"
+             "Answer directly from the data above:"),
+        ])
+        chain = prompt | self.llm
+        resp = chain.invoke({
+            "nl_response": (nl_response or "")[:400],
+            "preview":     result_preview[:2000],
+            "question":    question,
+        })
+        return resp.content.strip()
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -264,6 +309,24 @@ def interaction_node(state: AgentState) -> dict:
         "user_feedback":   None,
         "previous_sql":    None,
     }
+
+    # ── result_lookup: answer directly from previous result data ──────────
+    if result["intent"] == INTENT_RESULT_LOOKUP:
+        last = history[-1] if history else {}
+        prior_preview  = (last.get("result_preview") or "").strip()
+        prior_response = (last.get("nl_response") or "").strip()
+        if prior_preview:
+            logger.info("INTERACTION: result_lookup — answering from prior result data")
+            direct = agent.answer_from_result(
+                state["question"], prior_preview, prior_response
+            )
+        else:
+            # No result data in history — fall back to data_query
+            logger.warning("INTERACTION: result_lookup but no prior result_preview — falling back to data_query")
+            updates["intent"] = INTENT_FOLLOWUP
+            direct = ""
+        updates["direct_response"] = direct
+        return updates
 
     # Overwrite question with fully self-contained rewrite for follow-ups
     if result["intent"] == INTENT_FOLLOWUP:
