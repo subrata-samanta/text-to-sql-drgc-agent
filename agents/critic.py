@@ -40,6 +40,18 @@ Common Error Patterns:
 - Ambiguous column → Add table aliases
 - Join error → Verify foreign key relationships
 
+CRITICAL — THIS IS SQLite (NOT MySQL / SQL Server):
+- "no such function: YEAR"    → replace YEAR(col) with: year_nielsen column OR (year_month / 100)
+- "no such function: MONTH"   → replace MONTH(col) with: year_month % 100
+- "no such function: QUARTER" → use quarter_nielsen column directly
+- "no such function: NOW"     → use date('now')
+- "no such function: GETDATE"  → use date('now')
+- "no such function: ISNULL"  → use COALESCE(a, b)
+- "no such function: NVL"     → use COALESCE(a, b)
+- "near FROM: syntax error"   → remove trailing comma before FROM / GROUP BY / ORDER BY
+- TOP N not supported         → use LIMIT N
+- year_month is a YYYYMM INTEGER (e.g. 202301); do NOT wrap it in YEAR() or strftime()
+
 IMPORTANT: Return ONLY the fixed SQL query (no explanations, no markdown)
 
 SCHEMA:

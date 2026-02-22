@@ -76,6 +76,30 @@ SQL GENERATION RULES  –  MANDATORY FOR EVERY QUERY
 10. Display must NEVER be aggregated with SUM – use weighted average only.
 
 ──────────────────────────────────────────────────────────────────────────
+SQLite DIALECT RULES  –  THIS DATABASE IS SQLITE  (not MySQL / SQL Server)
+──────────────────────────────────────────────────────────────────────────
+• FORBIDDEN functions (will crash): YEAR(), MONTH(), QUARTER(), DATE_FORMAT(),
+  GETDATE(), NOW(), DATEADD(), DATEDIFF(), NVL(), ISNULL(), TOP N.
+
+• Time extraction from year_month (YYYYMM integer, e.g. 202301):
+    year  →  year_nielsen           (dedicated column — ALWAYS prefer this)
+    month →  year_month % 100
+    Do NOT wrap year_month in YEAR() — it is already an integer.
+
+• Time extraction from period_date (DATE string, e.g. '2023-01-28'):
+    year   →  CAST(strftime('%Y', period_date) AS INTEGER)
+    month  →  CAST(strftime('%m', period_date) AS INTEGER)
+    Use period_date only when year_month is insufficient for the question.
+
+• Quarterly analysis → use quarter_nielsen + year_nielsen columns directly;
+  NEVER compute QUARTER() from anything.
+
+• Pagination / row-limiting → LIMIT N   (not TOP N)
+• NULL coalescing         → COALESCE(a, b)   (not NVL / ISNULL)
+• Current date            → date('now')      (not GETDATE() / NOW())
+• No trailing commas before FROM, WHERE, GROUP BY, ORDER BY, HAVING.
+
+──────────────────────────────────────────────────────────────────────────
 CTE SKELETON  (adapt structure and names to the question)
 ──────────────────────────────────────────────────────────────────────────
 WITH <entity_cte> AS (

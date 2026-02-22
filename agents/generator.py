@@ -2,6 +2,8 @@
 SQL Generator Agent: Translates logical plans into SQL queries.
 """
 
+import re
+
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from loguru import logger
@@ -72,6 +74,107 @@ def _build_few_shot_block(examples: list) -> str:
         parts.append(f"Example {i}:\n  Question: {q}\n  SQL:\n{sql}\n")
     rendered = "\n".join(parts)
     return _FEW_SHOT_HEADER.format(examples=rendered)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SQLite compatibility patcher
+# Fixes common MySQL / SQL-Server functions that do not exist in SQLite.
+# Applied automatically after every LLM generation — before the SQL is used.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Columns known to store YYYYMM integers (never wrap in strftime)
+_INT_TIME_COLS = re.compile(
+    r"\b(year_month|year_nielsen|quarter_nielsen|month_num|period_num|week_num)\b",
+    re.IGNORECASE,
+)
+
+def _fix_sqlite_compat(sql: str) -> str:
+    """
+    Auto-patch non-SQLite function calls before the query reaches the database.
+
+    Handles:
+      YEAR(year_month)     → year_month / 100          (YYYYMM integer → year)
+      YEAR(period_date)    → CAST(strftime('%Y', period_date) AS INTEGER)
+      MONTH(year_month)    → year_month % 100
+      MONTH(period_date)   → CAST(strftime('%m', period_date) AS INTEGER)
+      QUARTER(anything)    → 'quarter_nielsen'  (column exists on the table)
+      DATE_FORMAT(c, f)    → strftime(sqlite_fmt, c)
+      GETDATE() / NOW()    → date('now')
+      ISNULL(a, b)         → COALESCE(a, b)
+      NVL(a, b)            → COALESCE(a, b)
+      TOP N                → removed (caller must add LIMIT N)
+      Trailing comma       → removed before FROM / WHERE / GROUP / ORDER / HAVING
+    """
+    original = sql
+
+    # ── 1. YEAR(col) ──────────────────────────────────────────────────────────
+    def _replace_year(m: re.Match) -> str:
+        col = m.group(1).strip()
+        if _INT_TIME_COLS.match(col.split()[0]):   # already an integer column
+            return f"({col} / 100)"
+        return f"CAST(strftime('%Y', {col}) AS INTEGER)"
+
+    sql = re.sub(r"\bYEAR\s*\(([^)]+)\)", _replace_year, sql, flags=re.IGNORECASE)
+
+    # ── 2. MONTH(col) ─────────────────────────────────────────────────────────
+    def _replace_month(m: re.Match) -> str:
+        col = m.group(1).strip()
+        if _INT_TIME_COLS.match(col.split()[0]):
+            return f"({col} % 100)"
+        return f"CAST(strftime('%m', {col}) AS INTEGER)"
+
+    sql = re.sub(r"\bMONTH\s*\(([^)]+)\)", _replace_month, sql, flags=re.IGNORECASE)
+
+    # ── 3. QUARTER(col) → quarter_nielsen column ──────────────────────────────
+    sql = re.sub(r"\bQUARTER\s*\([^)]+\)", "quarter_nielsen", sql, flags=re.IGNORECASE)
+
+    # ── 4. DATE_FORMAT(col, '%Y') → strftime('%Y', col) ──────────────────────
+    def _replace_date_format(m: re.Match) -> str:
+        col, fmt = m.group(1).strip(), m.group(2).strip()
+        # Map MySQL format specifiers to SQLite ones (they happen to match)
+        return f"strftime({fmt}, {col})"
+
+    sql = re.sub(
+        r"\bDATE_FORMAT\s*\(([^,]+),\s*([^)]+)\)",
+        _replace_date_format, sql, flags=re.IGNORECASE,
+    )
+
+    # ── 5. GETDATE() / NOW() → date('now') ────────────────────────────────────
+    sql = re.sub(r"\bGETDATE\s*\(\s*\)", "date('now')", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bNOW\s*\(\s*\)", "date('now')", sql, flags=re.IGNORECASE)
+
+    # ── 6. ISNULL(a, b) / NVL(a, b) → COALESCE(a, b) ────────────────────────
+    sql = re.sub(r"\bISNULL\s*\(", "COALESCE(", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bNVL\s*\(", "COALESCE(", sql, flags=re.IGNORECASE)
+
+    # ── 7. TOP N → strip it (LIMIT should be at end) ─────────────────────────
+    sql = re.sub(r"\bSELECT\s+TOP\s+\d+\s+", "SELECT ", sql, flags=re.IGNORECASE)
+
+    # ── 8. Trailing comma before clause keywords ──────────────────────────────
+    sql = re.sub(
+        r",\s*(FROM|WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|UNION|EXCEPT|INTERSECT)\b",
+        r" \1",
+        sql, flags=re.IGNORECASE,
+    )
+
+    if sql != original:
+        changed = []
+        checks = [
+            (r"\bYEAR\s*\(", "YEAR()"),
+            (r"\bMONTH\s*\(", "MONTH()"),
+            (r"\bQUARTER\s*\(", "QUARTER()"),
+            (r"\bDATE_FORMAT\s*\(", "DATE_FORMAT()"),
+            (r"\b(GETDATE|NOW)\s*\(", "GETDATE/NOW()"),
+            (r"\b(ISNULL|NVL)\s*\(", "ISNULL/NVL()"),
+        ]
+        for pat, label in checks:
+            if re.search(pat, original, flags=re.IGNORECASE):
+                changed.append(label)
+        if re.search(r",\s*(FROM|WHERE|GROUP|ORDER|HAVING)", original, flags=re.IGNORECASE):
+            changed.append("trailing-comma")
+        logger.info(f"SQLite compat patcher fixed: {', '.join(changed) or 'misc'}")
+
+    return sql
 
 
 class SQLGeneratorAgent:
@@ -199,8 +302,13 @@ class SQLGeneratorAgent:
         
         if sql_start_idx is not None:
             sql = "\n".join(lines[sql_start_idx:])
-        
-        return sql.strip()
+
+        sql = sql.strip()
+
+        # Auto-patch SQLite incompatible functions (YEAR, MONTH, QUARTER, etc.)
+        sql = _fix_sqlite_compat(sql)
+
+        return sql
 
 
 # Node function for LangGraph
