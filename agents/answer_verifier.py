@@ -16,12 +16,12 @@ A maximum number of verification attempts prevents infinite loops.
 """
 
 from typing import Literal
-from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from loguru import logger
 
 from core.state import AgentState
+from core.llm_factory import get_llm
 from config import settings
 
 # ─── Prompt ──────────────────────────────────────────────────────────────────
@@ -80,11 +80,6 @@ class AnswerVerifierAgent:
     """LLM-based answer quality verifier."""
 
     def __init__(self):
-        self._llm_kwargs = dict(
-            model=settings.groq_model_fast,       # fast model is fine for binary eval
-            temperature=0.0,
-            groq_api_key=settings.groq_api_key,
-        )
         self._prompt = ChatPromptTemplate.from_messages([
             ("system", _SYSTEM),
             ("user",   _USER),
@@ -148,7 +143,7 @@ class AnswerVerifierAgent:
 
         # ── LLM evaluation ───────────────────────────────────────────────────
         try:
-            llm   = ChatGroq(**self._llm_kwargs)
+            llm   = get_llm("fast")
             chain = self._prompt | llm | self._parser
             raw: dict = chain.invoke({
                 "question":    question,

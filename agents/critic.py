@@ -6,12 +6,12 @@ import re
 import difflib
 from typing import Dict, List, Optional, Tuple
 
-from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from loguru import logger
 from core.state import AgentState
 from core.database import db_manager
+from core.llm_factory import get_llm
 from config import settings
 
 # ── All real column names for the nielsen_pos table (used for fuzzy matching) ─
@@ -97,16 +97,8 @@ class CriticAgent:
     """
     
     def __init__(self):
-        self.llm = ChatGroq(
-            model=settings.groq_model_reasoning,
-            temperature=settings.groq_temperature,
-            groq_api_key=settings.groq_api_key
-        )
-        self._fast_llm = ChatGroq(
-            model=settings.groq_model_fast,
-            temperature=0.0,
-            groq_api_key=settings.groq_api_key,
-        )
+        self.llm = get_llm("reasoning")
+        self._fast_llm = get_llm("fast")
         self._col_resolve_prompt = ChatPromptTemplate.from_messages([
             ("system", _COL_RESOLVE_SYSTEM),
             ("user",   _COL_RESOLVE_USER),

@@ -1,9 +1,9 @@
 """Planner Agent: Breaks down complex questions into logical steps."""
 
-from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from loguru import logger
 from core.state import AgentState
+from core.llm_factory import get_llm
 from config import settings
 
 
@@ -11,11 +11,7 @@ class PlannerAgent:
     """Decomposes natural language questions into structured logical plans."""
     
     def __init__(self):
-        self.llm = ChatGroq(
-            model=settings.groq_model_reasoning,
-            temperature=settings.groq_temperature,
-            groq_api_key=settings.groq_api_key
-        )
+        self.llm = get_llm("reasoning")
         
         # System prompt for logical planning
         self.prompt = ChatPromptTemplate.from_messages([

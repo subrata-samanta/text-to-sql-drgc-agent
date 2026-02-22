@@ -8,7 +8,7 @@ from loguru import logger
 from graph import stream_agent_steps, stream_nl_response, NODE_LABELS
 from agents.interaction import DATA_INTENTS
 from tools import seed_examples, semantic_cache, few_shot_retriever
-from core.database import db_manager
+from core.database import get_db_manager, invalidate_db_cache
 from core.data_loader import DataLoader
 from config import settings
 
@@ -29,6 +29,29 @@ if "show_example_form" not in st.session_state:
     st.session_state.show_example_form = False
 if "show_correction_input" not in st.session_state:
     st.session_state.show_correction_input = False
+if "last_provider" not in st.session_state:
+    st.session_state.last_provider = settings.llm_provider
+
+
+# ── Apply provider switch mid-session ─────────────────────────────────────────
+def _apply_provider_switch(new_provider: str):
+    """
+    Called when the user changes the LLM provider in the sidebar.
+    Updates settings, invalidates the DB cache, and re-initialises the
+    few-shot retriever with the right embedding model.
+    """
+    import importlib
+    settings.llm_provider = new_provider
+    invalidate_db_cache()           # force a fresh DB manager for new provider
+
+    # Re-initialise the vector store with the right embedding model.
+    # The FewShotRetriever picks up settings.llm_provider at __init__ time.
+    from tools.vector_store import FewShotRetriever
+    import tools.vector_store as _vs_mod
+    _vs_mod.few_shot_retriever = FewShotRetriever()
+
+    st.session_state.last_provider = new_provider
+    logger.info(f"Provider switched to: {new_provider}")
 
 # ─── helpers ──────────────────────────────────────────────────────────────────────
 
@@ -123,10 +146,45 @@ def _render_turn(turn: dict, expanded: bool = False):
 with st.sidebar:
     st.header("⚙️ Configuration")
 
+    # ── LLM Provider selector ────────────────────────────────────────────────
+    st.subheader("🤖 LLM Provider")
+    provider_choice = st.radio(
+        "Select provider",
+        options=["groq", "dbrx"],
+        index=0 if settings.llm_provider == "groq" else 1,
+        format_func=lambda p: "🟢 Groq  (local DB + HuggingFace embeddings)"
+        if p == "groq"
+        else "🔵 DBRX  (Databricks Delta + Databricks embeddings)",
+        horizontal=False,
+        key="provider_radio",
+    )
+    if provider_choice != st.session_state.last_provider:
+        _apply_provider_switch(provider_choice)
+        st.success(f"Switched to **{provider_choice.upper()}** provider!")
+        st.rerun()
+
+    if settings.is_dbrx:
+        if not settings.databricks_token:
+            st.warning("⚠️ DATABRICKS_TOKEN not set in .env")
+        if not settings.databricks_host:
+            st.warning("⚠️ DATABRICKS_HOST not set in .env")
+        if not settings.databricks_http_path:
+            st.warning("⚠️ DATABRICKS_HTTP_PATH not set in .env")
+
+    st.markdown("---")
+
+    # ── Database status ─────────────────────────────────────────────────────
     st.subheader("Database")
     try:
-        tables = db_manager.get_all_table_names()
-        st.success(f"✅ Connected — {', '.join(tables)}")
+        _active_db = get_db_manager()
+        tables = _active_db.get_all_table_names()
+        if settings.is_dbrx:
+            st.success(
+                f"✅ Databricks — `{settings.databricks_catalog}.{settings.databricks_schema}`  "
+                f"({', '.join(tables) or 'no tables'})"
+            )
+        else:
+            st.success(f"✅ SQLite — {', '.join(tables)}")
     except Exception as e:
         st.error(f"DB error: {e}")
 
@@ -168,33 +226,36 @@ with st.sidebar:
 
     st.markdown("---")
 
-    st.subheader("📂 Upload Data")
-    with st.expander("Upload CSV / Excel"):
-        uploaded_files = st.file_uploader(
-            "Choose files", type=["csv", "xlsx", "xls"],
-            accept_multiple_files=True,
-        )
-        if uploaded_files and st.button("🚀 Load as nielsen_pos"):
-            db_path = settings.database_uri.replace("sqlite:///", "")
-            loader = DataLoader(db_path=db_path)
-            import tempfile
-            with st.spinner("Loading…"):
-                for uf in uploaded_files:
-                    try:
-                        with tempfile.NamedTemporaryFile(
-                            delete=False, suffix=Path(uf.name).suffix
-                        ) as tmp:
-                            tmp.write(uf.read())
-                            stats = loader.load_file(
-                                tmp.name, table_name="nielsen_pos",
-                                if_exists="replace",
-                            )
-                            st.success(f"✓ {stats['rows']} rows loaded as nielsen_pos")
-                            Path(tmp.name).unlink()
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-            db_manager.__class__.__init__(db_manager)
-            st.rerun()
+    if not settings.is_dbrx:
+        st.subheader("📂 Upload Data")
+        with st.expander("Upload CSV / Excel"):
+            uploaded_files = st.file_uploader(
+                "Choose files", type=["csv", "xlsx", "xls"],
+                accept_multiple_files=True,
+            )
+            if uploaded_files and st.button("🚀 Load as nielsen_pos"):
+                db_path = settings.database_uri.replace("sqlite:///", "")
+                loader = DataLoader(db_path=db_path)
+                import tempfile
+                with st.spinner("Loading…"):
+                    for uf in uploaded_files:
+                        try:
+                            with tempfile.NamedTemporaryFile(
+                                delete=False, suffix=Path(uf.name).suffix
+                            ) as tmp:
+                                tmp.write(uf.read())
+                                stats = loader.load_file(
+                                    tmp.name, table_name="nielsen_pos",
+                                    if_exists="replace",
+                                )
+                                st.success(f"✓ {stats['rows']} rows loaded as nielsen_pos")
+                                Path(tmp.name).unlink()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+                invalidate_db_cache()
+                st.rerun()
+    else:
+        st.info("📡 Using Databricks Delta tables — no local upload needed.")
 
 # ─── main header ────────────────────────────────────────────────────────────────────
 st.title("📊 Nielsen Text-to-SQL Agent")
@@ -414,7 +475,12 @@ if st.session_state.show_example_form:
 
 # ─── footer ─────────────────────────────────────────────────────────────────────────────
 st.markdown("---")
+_provider_label = (
+    "Databricks DBRX · Delta tables · Databricks embeddings"
+    if settings.is_dbrx
+    else "Groq LLM · SQLite · HuggingFace embeddings"
+)
 st.caption(
-    "Nielsen Text-to-SQL · LangGraph DRGC + Interaction Router "
-    "· Groq LLM · ChromaDB few-shot · SQLite"
+    f"Nielsen Text-to-SQL · LangGraph DRGC + Interaction Router "
+    f"· {_provider_label} · ChromaDB few-shot"
 )
