@@ -121,8 +121,17 @@ class NLResponderAgent:
         )
 
     def _build_input(self, state: AgentState, history: Optional[List[Dict]]) -> dict:
+        question = state["question"]
+        # Append answer-verifier feedback to the question so the LLM knows
+        # specifically what the previous answer missed.
+        answer_feedback = state.get("answer_feedback") or ""
+        if answer_feedback and state.get("answer_verify_attempts", 0) > 0:
+            question = (
+                f"{question}\n\n"
+                f"[IMPORTANT — previous answer was inadequate. Fix: {answer_feedback}]"
+            )
         return {
-            "question": state["question"],
+            "question": question,
             "result_preview": state.get("result_preview") or "No results returned.",
             "conversation_history": self._history_text(history),
         }

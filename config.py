@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     enable_dynamic_few_shot: bool = Field(default=True, env="ENABLE_DYNAMIC_FEW_SHOT")
     few_shot_examples_count: int = Field(default=3, env="FEW_SHOT_EXAMPLES_COUNT")
     query_timeout_seconds: int = Field(default=30, env="QUERY_TIMEOUT_SECONDS")
+
+    # Answer Verification (feedback-loop quality gate)
+    enable_answer_verification: bool = Field(default=True, env="ENABLE_ANSWER_VERIFICATION")
+    max_answer_verify_attempts: int  = Field(default=2,    env="MAX_ANSWER_VERIFY_ATTEMPTS")
     
     class Config:
         env_file = ".env"

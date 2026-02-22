@@ -226,6 +226,15 @@ class SQLGeneratorAgent:
             if previous_sql:
                 plan += f"\nPrevious SQL for reference (fix the issue):\n{previous_sql}"
 
+        # ── Answer verification feedback: injected when the answer-verifier
+        #    determined the generated answer did not address the question ──────
+        answer_feedback = state.get("answer_feedback") or ""
+        if answer_feedback and state.get("answer_verify_attempts", 0) > 0:
+            plan = (plan or "") + (
+                f"\n\n[ANSWER QUALITY ISSUE — re-write SQL to fix this]\n"
+                f"{answer_feedback}"
+            )
+
         schema_context = state.get("schema_context", "")
 
         if not schema_context:
