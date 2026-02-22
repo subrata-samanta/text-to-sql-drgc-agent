@@ -2,7 +2,7 @@
 
 from .interaction import InteractionAgent, interaction_node
 from .planner import PlannerAgent, planner_node
-from .retriever import SchemaLinkerAgent, schema_linker_node
+from .retriever import SchemaLinkerAgent, schema_linker_node, context_builder_node
 from .generator import SQLGeneratorAgent, generator_node
 from .filter_resolver import FilterResolverAgent, filter_resolver_node
 from .critic import CriticAgent, executor_node, reflector_node
@@ -21,6 +21,7 @@ __all__ = [
     "interaction_node",
     "planner_node",
     "schema_linker_node",
+    "context_builder_node",
     "generator_node",
     "filter_resolver_node",
     "executor_node",

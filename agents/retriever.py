@@ -280,3 +280,32 @@ def schema_linker_node(state: AgentState) -> dict:
     """LangGraph node wrapper for SchemaLinkerAgent."""
     agent = SchemaLinkerAgent()
     return agent.retrieve_schema(state)
+
+
+def context_builder_node(state: AgentState) -> dict:
+    """
+    Parallel context builder: runs schema linking + few-shot retrieval simultaneously.
+
+    Replaces the former sequential retrieve_few_shot → schema_retriever two-node
+    chain. Schema and few-shot examples are fetched ONCE per question and reused
+    on every retry (validation or execution), so there is no redundant I/O.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from tools import few_shot_retriever as _few_shot_retriever
+
+    question = state["question"]
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        schema_future = ex.submit(SchemaLinkerAgent().retrieve_schema, state)
+        few_shot_future = (
+            ex.submit(_few_shot_retriever.retrieve, question)
+            if settings.enable_dynamic_few_shot else None
+        )
+        schema_result = schema_future.result()
+        examples = few_shot_future.result() if few_shot_future else []
+
+    logger.info(
+        f"context_builder: schema ready + "
+        f"few_shot({len(examples)} example(s)) retrieved in parallel"
+    )
+    return {**schema_result, "few_shot_examples": examples}

@@ -427,12 +427,11 @@ def _validate_rule_based(question: str, sql: str) -> Tuple[bool, List[str]]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _build_llm():
-    """Build a fast, cheap LLM for validation (uses the 'fast' model slot)."""
-    from langchain_openai import ChatOpenAI
-    return ChatOpenAI(
-        model=settings.fast_model,
-        openai_api_base=settings.llm_api_base,
-        openai_api_key=settings.llm_api_key,
+    """Build a fast, cheap LLM for validation (uses the groq_model_fast slot)."""
+    from langchain_groq import ChatGroq
+    return ChatGroq(
+        model=settings.groq_model_fast,
+        groq_api_key=settings.groq_api_key,
         temperature=0,
         max_tokens=256,
     )

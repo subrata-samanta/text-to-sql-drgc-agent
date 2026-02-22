@@ -103,6 +103,26 @@ class SQLGeneratorAgent:
 
         question      = state["question"]
         plan          = state.get("plan", "")
+
+        # ── Smart retry: inject validation failure feedback ───────────────────
+        validation_issues = state.get("validation_issues") or []
+        if validation_issues and state.get("sql_validation_attempts", 0) > 0:
+            issues_block = "\n".join(f"  - {iss}" for iss in validation_issues)
+            plan = (plan or "") + (
+                f"\n\n[VALIDATION ISSUES — fix ALL of these in the new SQL]\n"
+                f"{issues_block}"
+            )
+
+        # ── Correction intent: inject user feedback + previous SQL ────────────
+        user_feedback = state.get("user_feedback") or ""
+        previous_sql  = state.get("previous_sql") or ""
+        if user_feedback:
+            plan = (plan or "") + (
+                f"\n\n[USER CORRECTION]\nUser says: {user_feedback}"
+            )
+            if previous_sql:
+                plan += f"\nPrevious SQL for reference (fix the issue):\n{previous_sql}"
+
         schema_context = state.get("schema_context", "")
 
         if not schema_context:
