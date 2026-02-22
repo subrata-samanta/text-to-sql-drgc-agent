@@ -78,6 +78,12 @@ class AgentState(TypedDict):
     # Each entry: {column, sql_value, db_match, clarification_q}
     pending_filter_clarification: Optional[List[Dict[str, Any]]]
 
+    # Answer Verification (set by AnswerVerifierAgent — post-responder feedback loop)
+    answer_satisfies_question: Optional[bool]   # True = answer fully addresses the question
+    answer_verdict: Optional[str]               # "satisfied" | "wrong_data" | "wrong_presentation"
+    answer_feedback: Optional[str]              # Actionable note fed back to generator/responder
+    answer_verify_attempts: Optional[int]       # Guard against infinite verification loops
+
     # Metadata
     start_time: Optional[float]  # For latency tracking
     cache_hit: Optional[bool]  # Whether result came from cache

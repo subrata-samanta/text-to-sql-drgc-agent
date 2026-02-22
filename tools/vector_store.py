@@ -1,14 +1,21 @@
 """
 Vector store for dynamic few-shot example retrieval.
 Examples are sourced from nielsen_few_shots.yaml.
+
+Embedding backend is chosen by the current llm_provider:
+  "groq"  → HuggingFace local sentence-transformers
+  "dbrx"  → Databricks Foundation Model embedding endpoint
+
+A separate ChromaDB collection is kept per provider so that switching
+providers doesn't corrupt the existing index.
 """
 
 from typing import List, Dict
 from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 from loguru import logger
 from config import settings
+from core.llm_factory import get_embedding_function
 import os
 import yaml
 
@@ -16,37 +23,43 @@ import yaml
 class FewShotRetriever:
     """
     Manages a vector store of SQL examples for dynamic few-shot learning.
+    Provider-aware: embedding model and ChromaDB collection are selected
+    based on settings.llm_provider at initialisation time.
     """
-    
+
     def __init__(self):
         self.enabled = settings.enable_dynamic_few_shot
-        
+
         if not self.enabled:
             logger.info("Dynamic few-shot learning disabled")
             return
-        
-        # Initialize embeddings with HuggingFace model (local)
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=settings.embedding_model
-        )
-        
-        # Initialize vector store
+
+        # Provider-aware embeddings
+        self.embeddings = get_embedding_function()
+
+        # Use a separate collection per provider to avoid dimension mismatches
+        provider = settings.llm_provider
+        collection_name = f"{settings.chroma_collection_name}_{provider}"
         persist_directory = settings.vector_store_path
         os.makedirs(persist_directory, exist_ok=True)
-        
+
         self.vectorstore = Chroma(
-            collection_name=settings.chroma_collection_name,
+            collection_name=collection_name,
             embedding_function=self.embeddings,
-            persist_directory=persist_directory
+            persist_directory=persist_directory,
         )
-        
-        logger.info(f"Few-shot retriever initialized with ChromaDB")
-        
+        self._collection_name = collection_name
+
+        logger.info(
+            f"Few-shot retriever initialised | provider={provider} | "
+            f"collection={collection_name}"
+        )
+
         # Auto-seed from YAML when the collection is empty
         if self.vectorstore._collection.count() == 0:
             logger.info("Vector store is empty – seeding from nielsen_few_shots.yaml")
             self._seed_from_yaml()
-    
+
     # ------------------------------------------------------------------
     # YAML loading
     # ------------------------------------------------------------------
@@ -255,11 +268,14 @@ def seed_examples(yaml_path: str = None):
     few_shot_retriever.clear()
 
     # Re-initialise the collection after clear()
+    provider = settings.llm_provider
+    collection_name = f"{settings.chroma_collection_name}_{provider}"
     few_shot_retriever.vectorstore = Chroma(
-        collection_name=settings.chroma_collection_name,
+        collection_name=collection_name,
         embedding_function=few_shot_retriever.embeddings,
         persist_directory=settings.vector_store_path,
     )
 
     few_shot_retriever._seed_from_yaml(yaml_path=yaml_path)
     logger.info("seed_examples() completed – vector store ready")
+

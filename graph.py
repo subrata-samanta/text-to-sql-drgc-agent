@@ -63,8 +63,10 @@ from agents import (
     reflector_node,
     responder_node,
     validator_node,
+    answer_verifier_node,
 )
 from agents.validator import MAX_VALIDATION_ATTEMPTS
+from agents.answer_verifier import MAX_ANSWER_VERIFY_ATTEMPTS
 from agents.interaction import DATA_INTENTS
 from config import settings
 
@@ -82,6 +84,7 @@ NODE_LABELS: Dict[str, str] = {
     "reflector":           "🔄  Self-correcting SQL",
     "post_reflect_filter": "🔎  Re-checking filters after correction",
     "responder":           "💬  Generating answer",
+    "answer_verifier":     "🔍  Verifying answer quality",
 }
 
 
@@ -135,6 +138,48 @@ def should_validate_result(
 
     logger.warning("Max validation attempts reached → force_execute")
     return "force_execute"
+
+
+def should_accept_answer(
+    state: AgentState,
+) -> Literal["end", "fix_data", "fix_presentation"]:
+    """
+    Gate after answer_verifier.
+
+    • Verification disabled in config         → end
+    • answer_satisfies_question = True        → end
+    • Max verify attempts reached             → end  (best-effort)
+    • verdict = wrong_data                    → fix_data        (loops to generator)
+    • verdict = wrong_presentation            → fix_presentation (loops to responder)
+    """
+    if not settings.enable_answer_verification:
+        return "end"
+
+    if state.get("answer_satisfies_question", True):
+        logger.info("ANSWER VERIFIER gate: satisfied → end")
+        return "end"
+
+    max_attempts = getattr(settings, "max_answer_verify_attempts", MAX_ANSWER_VERIFY_ATTEMPTS)
+    attempts     = state.get("answer_verify_attempts", 0)
+    if attempts >= max_attempts:
+        logger.warning(
+            f"ANSWER VERIFIER gate: max attempts ({max_attempts}) reached → end (best-effort)"
+        )
+        return "end"
+
+    verdict = state.get("answer_verdict", "satisfied")
+    feedback = state.get("answer_feedback", "")
+
+    if verdict == "wrong_data":
+        logger.info(f"ANSWER VERIFIER gate: wrong_data → regenerate SQL | {feedback!r}")
+        return "fix_data"
+
+    if verdict == "wrong_presentation":
+        logger.info(f"ANSWER VERIFIER gate: wrong_presentation → re-respond | {feedback!r}")
+        return "fix_presentation"
+
+    # Fallback (unknown verdict)
+    return "end"
 
 
 def should_continue(
@@ -227,6 +272,7 @@ def build_graph() -> StateGraph:
     workflow.add_node("reflector",           reflector_node)
     workflow.add_node("post_reflect_filter", post_reflect_filter_node)
     workflow.add_node("responder",           responder_node)
+    workflow.add_node("answer_verifier",     answer_verifier_node)
 
     # ── Entry ─────────────────────────────────────────────────────────────────
     workflow.set_entry_point("init")
@@ -299,8 +345,25 @@ def build_graph() -> StateGraph:
         {"execute": "executor"},
     )
 
-    # Terminal
-    workflow.add_edge("responder", END)
+    # ── Answer verification feedback loop ─────────────────────────────────────────
+    # Responder always passes through the verifier before ending.
+    workflow.add_edge("responder", "answer_verifier")
+
+    # Verifier gate:
+    #   satisfied / max-attempts  → END
+    #   wrong_data                → generator  (re-generate SQL with feedback injected;
+    #                                           schema/few-shot already in state — no
+    #                                           redundant context_builder call)
+    #   wrong_presentation        → responder  (re-word the answer, no new SQL)
+    workflow.add_conditional_edges(
+        "answer_verifier",
+        should_accept_answer,
+        {
+            "end":              END,
+            "fix_data":         "generator",   # loops: generator → filter_resolver → … → responder
+            "fix_presentation": "responder",   # short loop: responder only
+        },
+    )
 
     logger.info("Graph built successfully")
     return workflow
@@ -370,6 +433,11 @@ def _make_initial_state(
         "filter_log":        None,
         "needs_clarification": False,
         "pending_filter_clarification": None,
+        # Answer verification (feedback loop)
+        "answer_satisfies_question": None,
+        "answer_verdict":            None,
+        "answer_feedback":           None,
+        "answer_verify_attempts":    0,
     }
 
 

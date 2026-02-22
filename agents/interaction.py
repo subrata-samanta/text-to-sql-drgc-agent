@@ -23,11 +23,11 @@ import json
 import re
 from typing import Dict, List, Optional
 
-from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from loguru import logger
 
 from core.state import AgentState
+from core.llm_factory import get_llm
 from config import settings
 
 # ── Intent vocabulary ─────────────────────────────────────────────────────────
@@ -113,11 +113,7 @@ class InteractionAgent:
     """
 
     def __init__(self) -> None:
-        self.llm = ChatGroq(
-            model=settings.groq_model_fast,
-            temperature=0,
-            groq_api_key=settings.groq_api_key,
-        )
+        self.llm = get_llm("fast")
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", _SYSTEM),
             ("user", _USER),

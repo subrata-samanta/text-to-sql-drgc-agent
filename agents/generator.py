@@ -4,10 +4,10 @@ SQL Generator Agent: Translates logical plans into SQL queries.
 
 import re
 
-from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from loguru import logger
 from core.state import AgentState
+from core.llm_factory import get_llm
 from config import settings
 
 
@@ -242,11 +242,7 @@ class SQLGeneratorAgent:
     """
 
     def __init__(self):
-        self.llm = ChatGroq(
-            model=settings.groq_model_reasoning,
-            temperature=settings.groq_temperature,
-            groq_api_key=settings.groq_api_key
-        )
+        self.llm = get_llm("reasoning")
 
         self.generation_prompt = ChatPromptTemplate.from_messages([
             ("system", _BASE_SYSTEM),
@@ -282,6 +278,15 @@ class SQLGeneratorAgent:
             )
             if previous_sql:
                 plan += f"\nPrevious SQL for reference (fix the issue):\n{previous_sql}"
+
+        # ── Answer verification feedback: injected when the answer-verifier
+        #    determined the generated answer did not address the question ──────
+        answer_feedback = state.get("answer_feedback") or ""
+        if answer_feedback and state.get("answer_verify_attempts", 0) > 0:
+            plan = (plan or "") + (
+                f"\n\n[ANSWER QUALITY ISSUE — re-write SQL to fix this]\n"
+                f"{answer_feedback}"
+            )
 
         schema_context = state.get("schema_context", "")
 
@@ -363,7 +368,9 @@ class SQLGeneratorAgent:
         sql = sql.strip()
 
         # Auto-patch SQLite incompatible functions (YEAR, MONTH, QUARTER, etc.)
-        sql = _fix_sqlite_compat(sql)
+        # Skip for DBRX/Databricks — Spark SQL supports these functions natively.
+        if not settings.is_dbrx:
+            sql = _fix_sqlite_compat(sql)
 
         return sql
 

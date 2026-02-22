@@ -8,6 +8,7 @@ from .filter_resolver import FilterResolverAgent, filter_resolver_node
 from .critic import CriticAgent, executor_node, reflector_node
 from .responder import NLResponderAgent, responder_node
 from .validator import SQLValidatorAgent, validator_node
+from .answer_verifier import AnswerVerifierAgent, answer_verifier_node
 
 __all__ = [
     "InteractionAgent",
@@ -18,6 +19,7 @@ __all__ = [
     "CriticAgent",
     "NLResponderAgent",
     "SQLValidatorAgent",
+    "AnswerVerifierAgent",
     "interaction_node",
     "planner_node",
     "schema_linker_node",
@@ -28,4 +30,5 @@ __all__ = [
     "reflector_node",
     "responder_node",
     "validator_node",
+    "answer_verifier_node",
 ]

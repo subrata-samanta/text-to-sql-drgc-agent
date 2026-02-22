@@ -10,6 +10,10 @@ langchain-core>=0.1.0
 # Database
 sqlalchemy>=2.0.0
 sqlglot>=20.0.0
+databricks-sql-connector>=3.0.0
+
+# Databricks LLM / Embeddings (used when LLM_PROVIDER=dbrx)
+langchain-databricks>=0.1.0
 
 # Vector Store and Embeddings
 chromadb>=0.4.22

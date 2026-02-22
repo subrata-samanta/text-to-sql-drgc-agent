@@ -8,11 +8,11 @@ import re
 
 import sqlglot
 import sqlglot.expressions as exp
-from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from loguru import logger
 
 from core.state import AgentState
+from core.llm_factory import get_llm
 from config import settings
 
 
@@ -92,11 +92,8 @@ class NLResponderAgent:
     """Generates natural language answers from SQL results."""
 
     def __init__(self):
-        self._base_llm_kwargs = dict(
-            model=settings.groq_model_reasoning,
-            temperature=0.1,
-            groq_api_key=settings.groq_api_key,
-        )
+        # LLM is resolved via the factory on every call so that provider
+        # switches mid-session are automatically picked up.
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", _SYSTEM),
             ("user", _USER),
@@ -121,8 +118,17 @@ class NLResponderAgent:
         )
 
     def _build_input(self, state: AgentState, history: Optional[List[Dict]]) -> dict:
+        question = state["question"]
+        # Append answer-verifier feedback to the question so the LLM knows
+        # specifically what the previous answer missed.
+        answer_feedback = state.get("answer_feedback") or ""
+        if answer_feedback and state.get("answer_verify_attempts", 0) > 0:
+            question = (
+                f"{question}\n\n"
+                f"[IMPORTANT — previous answer was inadequate. Fix: {answer_feedback}]"
+            )
         return {
-            "question": state["question"],
+            "question": question,
             "result_preview": state.get("result_preview") or "No results returned.",
             "conversation_history": self._history_text(history),
         }
@@ -286,7 +292,7 @@ class NLResponderAgent:
         }
 
         if streaming:
-            llm = ChatGroq(**self._base_llm_kwargs, streaming=True)
+            llm = get_llm("reasoning", streaming=True)
             chain = self.prompt_no_data | llm
 
             def _gen():
@@ -295,7 +301,7 @@ class NLResponderAgent:
                         yield chunk.content
             return _gen()
         else:
-            llm = ChatGroq(**self._base_llm_kwargs)
+            llm = get_llm("reasoning")
             chain = self.prompt_no_data | llm
             return chain.invoke(inp).content.strip()
 
@@ -333,7 +339,7 @@ class NLResponderAgent:
         }
 
         if streaming:
-            llm = ChatGroq(**self._base_llm_kwargs, streaming=True)
+            llm = get_llm("reasoning", streaming=True)
             chain = self.prompt_error | llm
 
             def _gen():
@@ -342,7 +348,7 @@ class NLResponderAgent:
                         yield chunk.content
             return _gen()
         else:
-            llm = ChatGroq(**self._base_llm_kwargs)
+            llm = get_llm("reasoning")
             chain = self.prompt_error | llm
             return chain.invoke(inp).content.strip()
 
@@ -393,7 +399,7 @@ class NLResponderAgent:
 
         # ── normal path ──
         try:
-            llm = ChatGroq(**self._base_llm_kwargs)
+            llm = get_llm("reasoning")
             chain = self.prompt | llm
             history = conversation_history or state.get("conversation_history")
             resp = chain.invoke(self._build_input(state, history))
@@ -442,7 +448,7 @@ class NLResponderAgent:
 
         # ── normal path ──
         try:
-            streaming_llm = ChatGroq(**self._base_llm_kwargs, streaming=True)
+            streaming_llm = get_llm("reasoning", streaming=True)
             chain = self.prompt | streaming_llm
             history = conversation_history or state.get("conversation_history")
             for chunk in chain.stream(self._build_input(state, history)):
