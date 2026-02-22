@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     enable_self_correction: bool = Field(default=True, env="ENABLE_SELF_CORRECTION")
     enable_dynamic_few_shot: bool = Field(default=True, env="ENABLE_DYNAMIC_FEW_SHOT")
     few_shot_examples_count: int = Field(default=3, env="FEW_SHOT_EXAMPLES_COUNT")
+    # Smart category-aware retrieval: top-N examples fetched per detected category
+    few_shot_per_category_count: int = Field(default=2, env="FEW_SHOT_PER_CATEGORY_COUNT")
     query_timeout_seconds: int = Field(default=30, env="QUERY_TIMEOUT_SECONDS")
 
     # ── Answer Verification (feedback-loop quality gate) ──────────────────────

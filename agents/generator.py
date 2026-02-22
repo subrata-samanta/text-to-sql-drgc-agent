@@ -106,25 +106,38 @@ For EACH example:
 
 def _build_few_shot_block(examples: list) -> str:
     """Render few-shot examples as an inline system-prompt section.
-    
-    Includes category, explanation (business logic), and annotated SQL
-    so the LLM understands WHY the SQL is structured a particular way.
+
+    Prominently surfaces share_numerator / share_denominator (the exact
+    YAML business-logic fields) so the LLM cannot miss them.
     """
     if not examples:
         return ""
     parts = []
     for i, ex in enumerate(examples, 1):
-        q           = ex.get("question", "").strip()
-        sql         = ex.get("sql", "").strip()
-        explanation = ex.get("explanation", "").strip()
-        category    = ex.get("category", "").strip()
+        q                = ex.get("question", "").strip()
+        sql              = ex.get("sql", "").strip()
+        explanation      = ex.get("explanation", "").strip()
+        category         = ex.get("category", "").strip()
+        share_numerator  = ex.get("share_numerator", "").strip()
+        share_denominator = ex.get("share_denominator", "").strip()
 
         lines = [f"Example {i}  [Category: {category}]" if category else f"Example {i}"]
         lines.append(f"  Question : {q}")
+
+        # ── Critical: expose numerator/denominator logic explicitly ──────────
+        if share_numerator:
+            lines.append(f"  *** NUMERATOR FILTER  (entity being measured)  : {share_numerator}")
+        if share_denominator:
+            lines.append(f"  *** DENOMINATOR FILTER (total market/category) : {share_denominator}")
         if explanation:
-            lines.append(f"  Business Logic: {explanation}")
+            lines.append(f"  Business Logic : {explanation}")
+        if share_numerator or share_denominator:
+            lines.append(
+                "  RULE: Your SQL MUST apply the NUMERATOR filter in the entity CTE "
+                "and the DENOMINATOR filter in the market/total CTE — exactly as shown."
+            )
+
         lines.append(f"  SQL:")
-        # Indent each SQL line for readability
         for sql_line in sql.splitlines():
             lines.append(f"    {sql_line}")
         parts.append("\n".join(lines))

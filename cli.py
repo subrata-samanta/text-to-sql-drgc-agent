@@ -33,6 +33,7 @@ try:
     from rich.rule import Rule
     from rich.text import Text
     from rich.padding import Padding
+    from rich.console import Group as RichGroup
     from rich import box
     RICH = True
 except ImportError:
@@ -120,6 +121,71 @@ def _error(msg: str):
         console.print(f"  ✗  {msg}", style="bold red")
     else:
         print(f"  ERROR: {msg}")
+
+
+def _print_few_shots_detail(examples: list):
+    """Print full details of retrieved few-shot examples (SQL, explanation, filters)."""
+    if not examples:
+        return
+    if RICH:
+        console.print()
+        console.print(Rule("[bold magenta]📎  Few-Shot Examples Passed to LLM[/bold magenta]", style="magenta"))
+    else:
+        print()
+        print("─" * 72)
+        print("  📎  Few-Shot Examples Passed to LLM")
+        print("─" * 72)
+
+    for i, ex in enumerate(examples, 1):
+        q            = ex.get("question", "").strip()
+        sql          = ex.get("sql", "").strip()
+        explanation  = ex.get("explanation", "").strip()
+        category     = ex.get("category", "").strip()
+        numerator    = ex.get("share_numerator", "").strip()
+        denominator  = ex.get("share_denominator", "").strip()
+
+        if RICH:
+            lines = []
+            lines.append(f"[bold cyan]Question :[/bold cyan] {q}")
+            if category:
+                lines.append(f"[bold]Category :[/bold] {category}")
+            if numerator:
+                lines.append(f"[bold yellow]Numerator:[/bold yellow] {numerator}")
+            if denominator:
+                lines.append(f"[bold yellow]Denominator:[/bold yellow] {denominator}")
+            if explanation:
+                lines.append(f"[bold]Logic    :[/bold] {explanation}")
+            lines.append("")
+            lines.append(f"[bold green]SQL:[/bold green]")
+            body = "\n".join(lines)
+            console.print(Panel(
+                RichGroup(
+                    Text.from_markup(body),
+                    Syntax(sql, "sql", theme="monokai", word_wrap=True),
+                ),
+                title=f"[bold magenta]Example {i}[/bold magenta]",
+                border_style="magenta",
+                padding=(0, 1),
+            ))
+        else:
+            print(f"\n  Example {i}")
+            print(f"  {'─'*68}")
+            print(f"  Question  : {q}")
+            if category:
+                print(f"  Category  : {category}")
+            if numerator:
+                print(f"  Numerator : {numerator}")
+            if denominator:
+                print(f"  Denominator: {denominator}")
+            if explanation:
+                print(f"  Logic     : {explanation}")
+            print(f"  SQL:")
+            for line in sql.splitlines():
+                print(f"    {line}")
+    if RICH:
+        console.print(Rule(style="magenta"))
+    else:
+        print("─" * 72)
 
 
 def _print_sql(sql: str):
@@ -282,6 +348,7 @@ def run_question(
     conversation_history: Optional[List[Dict]] = None,
     show_steps: bool = True,
     stream: bool = True,
+    show_few_shots: bool = False,
 ) -> Dict:
     """Run a single question through the agent and print formatted output."""
     from config import settings as _settings
@@ -342,6 +409,42 @@ def run_question(
             if detected_intent not in DATA_INTENTS:
                 continue
 
+            # ── context_builder (schema + few-shot retrieval) ─────────────────
+            # Handle BEFORE the steps guard so --show-few-shots always fires,
+            # even when --no-steps is passed.
+            if node == "context_builder":
+                examples = output.get("few_shot_examples") or []
+                if show_steps:
+                    step_num += 1
+                    # Group examples by category for display
+                    cats_seen: list = []
+                    cat_counts: dict = {}
+                    for ex in examples:
+                        c = ex.get("category", "—")
+                        if c not in cat_counts:
+                            cats_seen.append(c)
+                            cat_counts[c] = 0
+                        cat_counts[c] += 1
+                    # Schema columns
+                    meta = output.get("schema_metadata") or {}
+                    cols = list(meta.keys())
+                    rows = []
+                    if cats_seen:
+                        rows.append(("Categories", ", ".join(cats_seen)))
+                        for ex in examples:
+                            rows.append((f"  ↳ [{ex.get('category','?')}]",
+                                         ex.get("question", "—")[:72]))
+                    else:
+                        rows.append(("Examples", "None retrieved"))
+                    rows.append(("Schema cols", f"{len(cols)} selected"))
+                    _print_step_box(step_num, label,
+                                    f"{len(examples)} example(s) · {len(cols)} col(s)",
+                                    rows=rows)
+                # Always show full details when steps are visible, or when explicitly requested
+                if (show_steps or show_few_shots) and examples:
+                    _print_few_shots_detail(examples)
+                continue
+
             if not show_steps:
                 continue
 
@@ -371,24 +474,6 @@ def run_question(
                     for i, line in enumerate(plan.strip().splitlines(), 1):
                         rows.append((f"  {i}.", line.strip()))
                 _print_step_box(step_num, label, "", rows=rows)
-                continue
-
-            # ── retrieve_few_shot ──
-            if node == "retrieve_few_shot":
-                examples = output.get("few_shot_examples") or []
-                rows = [(f"  {i+1}.", ex.get("question", "—")[:80])
-                        for i, ex in enumerate(examples)]
-                _print_step_box(step_num, label, f"{len(examples)} example(s)",
-                                rows=rows or [("Result", "No examples found")])
-                continue
-
-            # ── schema_retriever ──
-            if node == "schema_retriever":
-                meta = output.get("schema_metadata") or {}
-                cols = list(meta.keys())
-                rows = [(f"  {i+1}.", c) for i, c in enumerate(cols)]
-                _print_step_box(step_num, label, f"{len(cols)} column(s) selected",
-                                rows=rows or [("Result", "No columns selected")])
                 continue
 
             # ── filter_resolver ──
@@ -554,7 +639,7 @@ def run_question(
 
 # ─── interactive conversation loop ────────────────────────────────────────────
 
-def interactive_loop(show_steps: bool = True, stream: bool = True):
+def interactive_loop(show_steps: bool = True, stream: bool = True, show_few_shots: bool = False):
     """Multi-turn conversation loop with history."""
     if RICH:
         console.print(Panel(
@@ -613,6 +698,7 @@ def interactive_loop(show_steps: bool = True, stream: bool = True):
                 conversation_history=conversation_history,
                 show_steps=show_steps,
                 stream=stream,
+                show_few_shots=show_few_shots,
             )
             if final_state.get("nl_response"):
                 conversation_history.append({
@@ -643,6 +729,7 @@ def main():
           python cli.py "What was MONDELEZ market share in TOTAL BARS in 2024?"
           python cli.py "Compare OREO sales Dec 2023 vs Mar 2024" --no-stream --no-steps
           python cli.py "How did sales trend YTD?" --cache
+          python cli.py "What were OREO sales in 2024?" --show-few-shots
         """),
     )
     parser.add_argument("question", nargs="?", default=None,
@@ -653,6 +740,8 @@ def main():
                         help="Hide step-by-step agent thinking")
     parser.add_argument("--cache", action="store_true",
                         help="Enable semantic cache (off by default)")
+    parser.add_argument("--show-few-shots", action="store_true",
+                        help="Print few-shot examples even when --no-steps is used (always shown with steps)")
     args = parser.parse_args()
 
     do_stream = not args.no_stream
@@ -668,10 +757,14 @@ def main():
         else:
             print("⚡ Semantic cache enabled")
 
+    do_show_few_shots = args.show_few_shots
+
     if args.question:
-        run_question(args.question, show_steps=do_steps, stream=do_stream)
+        run_question(args.question, show_steps=do_steps, stream=do_stream,
+                     show_few_shots=do_show_few_shots)
     else:
-        interactive_loop(show_steps=do_steps, stream=do_stream)
+        interactive_loop(show_steps=do_steps, stream=do_stream,
+                         show_few_shots=do_show_few_shots)
 
 
 if __name__ == "__main__":
