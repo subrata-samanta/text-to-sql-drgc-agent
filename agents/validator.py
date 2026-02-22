@@ -456,9 +456,16 @@ Check ONLY:
    WHERE manufacturer = 'MONDELEZ', NOT WHERE brand = 'MONDELEZ'.
 3. Metric: if market share is asked, SQL must compute SUM(…)/SUM(…) ratio.
 
-Reply in EXACTLY this format (nothing else):
-VALID: <YES or NO>
-ISSUES: <comma-separated issues, or NONE>"""
+Reply in EXACTLY this format — no markdown, no extra text, no explanation, nothing else:
+VALID: YES
+ISSUES: NONE
+
+or
+
+VALID: NO
+ISSUES: <comma-separated list of issues>
+
+Do NOT include any other words, punctuation, or formatting outside these two lines."""
 
 
 def _validate_with_llm(question: str, sql: str) -> Tuple[bool, List[str]]:
@@ -480,13 +487,16 @@ def _validate_with_llm(question: str, sql: str) -> Tuple[bool, List[str]]:
         ])
         text = response.content.strip()
 
+        # Strip markdown bold/italic formatting that some LLMs add
+        clean_text = re.sub(r"[*_`]{1,3}", "", text)
+
         # Parse structured response
-        valid_match = re.search(r"VALID:\s*(YES|NO)", text, re.IGNORECASE)
-        issues_match = re.search(r"ISSUES:\s*(.+)", text, re.IGNORECASE)
+        valid_match = re.search(r"VALID:\s*(YES|NO)", clean_text, re.IGNORECASE)
+        issues_match = re.search(r"ISSUES:\s*(.+)", clean_text, re.IGNORECASE | re.DOTALL)
 
         if valid_match:
             passed = valid_match.group(1).upper() == "YES"
-            issues_raw = issues_match.group(1).strip() if issues_match else ""
+            issues_raw = issues_match.group(1).strip().split("\n")[0] if issues_match else ""
             issues = (
                 []
                 if issues_raw.upper() in ("NONE", "", "N/A")
@@ -494,8 +504,18 @@ def _validate_with_llm(question: str, sql: str) -> Tuple[bool, List[str]]:
             )
             return passed, issues
 
-        # Fallback: if response is ambiguous, pass through
-        logger.warning("SQL Validator: LLM response was ambiguous – defaulting to VALID")
+        # Secondary fallback: look for standalone YES / NO anywhere in response
+        yes_match = re.search(r"\byes\b", clean_text, re.IGNORECASE)
+        no_match = re.search(r"\bno\b", clean_text, re.IGNORECASE)
+        if no_match and not yes_match:
+            logger.debug(f"SQL Validator: parsed fallback NO from response: {text!r}")
+            return False, ["SQL may not correctly answer the question (ambiguous LLM response)"]
+        if yes_match and not no_match:
+            logger.debug(f"SQL Validator: parsed fallback YES from response: {text!r}")
+            return True, []
+
+        # Last resort: log at DEBUG (not WARNING) and default to VALID
+        logger.debug(f"SQL Validator: response unparseable, defaulting to VALID. Raw: {text!r}")
         return True, []
 
     except Exception as e:

@@ -25,15 +25,33 @@ The database has a SINGLE table called `nielsen_pos`.
 Your task: Decompose the user's question into clear, numbered logical steps.
 
 Guidelines:
-1. Identify the core intent (market share, period comparison, performance tracking, growth analysis)
+1. CLASSIFY the query intent — state it explicitly on the FIRST line as:
+   INTENT: <one of MARKET_SHARE | PERIOD_COMPARISON | PERFORMANCE_TRACKING | GROWTH_ANALYSIS | RANKING | OTHER>
+
 2. Resolve follow-up references — if the question says "same product" or "that brand", use the
-   conversation history to identify what it refers to and name it explicitly in the plan
-3. Break down into atomic logical steps: filters → aggregations → calculations → comparisons
-4. Define metrics and formulas explicitly (e.g., market_share = entity_sales / total_market_sales)
+   conversation history to identify what it refers to and name it explicitly in the plan.
+
+3. Break down into atomic logical steps: filters → aggregations → calculations → comparisons.
+
+4. Define metrics and formulas explicitly:
+   - Market share  → NUMERATOR: <entity filter>  /  DENOMINATOR: <broader category/market filter>
+   - Period compare → period1 metric  vs  period2 metric  + % change
+   - Growth        → (current - prior) / prior * 100
+   - TDP average   → SUM(tdp) / COUNT(DISTINCT period_date)
+   - Velocity      → SUM(sales_units) / SUM(tdp)
+
 5. Always specify the geographic filter priority:
    customer named? → filter by customer; division named? → filter by division;
    market named? → filter by market; otherwise → total = 'Total US xAOC + Conv'
-6. Output: A clear, numbered plan only. Do NOT write SQL.
+
+6. For MARKET_SHARE queries, explicitly state:
+   NUMERATOR FILTER: <exact entity column = value>
+   DENOMINATOR FILTER: <broader column IN (value) representing the total market>
+
+7. Identify entity hierarchy column (use HIGHEST-priority match):
+   mega_category → manufacturer → category → sub_category → brand → subbrand → ppg
+
+8. Output: A clear, numbered plan only. Do NOT write SQL.
 
 Conversation history (for resolving follow-up questions):
 {conversation_history}"""),

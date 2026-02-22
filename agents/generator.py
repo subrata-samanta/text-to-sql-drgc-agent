@@ -20,9 +20,10 @@ business logic of this organisation.
 PRIORITY ORDER  (follow from highest to lowest)
 ════════════════════════════════════════════════════════════════════════
   1. FEW-SHOT EXAMPLES  — these encode REAL business logic and must be
-     replicated as closely as possible.  SQL patterns, CTE structure,
-     metric formulas, and filter logic shown in the examples ARE the
-     ground truth.  Any deviation requires explicit justification.
+     fully understood and replicated.  SQL patterns, CTE structure,
+     metric formulas, numerator/denominator logic, and filter conventions
+     shown in the examples ARE the ground truth.  Any deviation requires
+     explicit justification.
   2. SCHEMA & CTE RULES — use only the columns and table in the schema;
      obey every mandatory SQL rule listed there.
   3. LOGICAL PLAN — translate the plan into SQL, but never override the
@@ -41,21 +42,61 @@ LOGICAL PLAN:
 USER QUESTION:
 {question}
 
-INSTRUCTIONS:
-- IF examples were provided above, replicate their CTE structure, metric
-  definitions, and filter logic.  Treat them as templates, not hints.
-- Return ONLY executable SQL — no markdown fences, no prose explanation.
-- Think step by step (Chain-of-Thought) before writing the final query,
-  but strip the reasoning from your final answer.
+MANDATORY ANALYSIS BEFORE WRITING SQL
+——————————————————————————————————————
+Before producing any SQL, you MUST silently work through these steps:
+
+STEP 1 — IDENTIFY QUERY CATEGORY
+  Classify the question into one of:
+  • MARKET_SHARE       → ratio of entity sales to broader market/category sales
+  • PERIOD_COMPARISON  → compare a metric across two time periods
+  • PERFORMANCE_TRACKING → trend or total of a metric over time
+  • GROWTH_ANALYSIS    → YoY / QoQ / MoM growth rates
+  • RANKING            → top-N / bottom-N by metric
+  • OTHER              → describe briefly
+
+STEP 2 — EXTRACT BUSINESS LOGIC FROM MATCHING EXAMPLES
+  Look at every example whose category matches the query category above.
+  For each example, extract:
+  a) What is the NUMERATOR filter?  (e.g. manufacturer = 'X' AND category = 'Y')
+  b) What is the DENOMINATOR filter?  (e.g. mega_category IN ('Y'))
+  c) What CTE names and structure does it use?
+  d) What geographic filter does it apply?
+  e) What time filter does it use (year_nielsen / year_month / period_date)?
+
+STEP 3 — MAP CURRENT QUESTION TO EXAMPLE LOGIC
+  Apply the extracted business logic to the current question:
+  a) Identify the entity (brand / manufacturer / category / etc.)
+  b) Identify the market denominator (what is the "total market" here?)
+  c) Confirm temporal scope (year / month / quarter / range)
+  d) Confirm geographic filter (customer / division / market / default total)
+
+STEP 4 — GENERATE SQL
+  Write SQL that strictly follows the CTE structure and metric formulas
+  from the most similar example(s). DO NOT invent a new pattern when an
+  example already provides one for this query category.
+
+FINAL OUTPUT RULES:
+- Return ONLY executable SQL — no markdown fences, no prose, no comments
+  explaining your analysis.
+- The analysis (Steps 1-3) is INTERNAL reasoning only; strip it entirely
+  from your answer.
 """
 
 _FEW_SHOT_HEADER = """\
 ════════════════════════════════════════════════════════════════════════
 MANDATORY BUSINESS-LOGIC EXAMPLES  (highest priority — follow exactly)
 ════════════════════════════════════════════════════════════════════════
-The SQL patterns below were written by business analysts and encode the
-EXACT formulas, filters, and CTE conventions required.  Study each
-example carefully before writing your query.
+These examples were written by Nielsen business analysts and encode the
+EXACT formulas, numerator/denominator logic, CTE conventions, and filter
+rules required for this domain.
+
+For EACH example:
+  • Read the BUSINESS LOGIC explanation to understand WHY the SQL is
+    structured that way — not just HOW.
+  • Note the numerator filter, denominator filter, geographic filter,
+    temporal filter, and CTE structure.
+  • Use the closest matching example as a template for your SQL.
 
 {examples}
 ════════════════════════════════════════════════════════════════════════
@@ -64,15 +105,31 @@ example carefully before writing your query.
 
 
 def _build_few_shot_block(examples: list) -> str:
-    """Render few-shot examples as an inline system-prompt section."""
+    """Render few-shot examples as an inline system-prompt section.
+    
+    Includes category, explanation (business logic), and annotated SQL
+    so the LLM understands WHY the SQL is structured a particular way.
+    """
     if not examples:
         return ""
     parts = []
     for i, ex in enumerate(examples, 1):
-        q   = ex.get("question", "").strip()
-        sql = ex.get("sql", "").strip()
-        parts.append(f"Example {i}:\n  Question: {q}\n  SQL:\n{sql}\n")
-    rendered = "\n".join(parts)
+        q           = ex.get("question", "").strip()
+        sql         = ex.get("sql", "").strip()
+        explanation = ex.get("explanation", "").strip()
+        category    = ex.get("category", "").strip()
+
+        lines = [f"Example {i}  [Category: {category}]" if category else f"Example {i}"]
+        lines.append(f"  Question : {q}")
+        if explanation:
+            lines.append(f"  Business Logic: {explanation}")
+        lines.append(f"  SQL:")
+        # Indent each SQL line for readability
+        for sql_line in sql.splitlines():
+            lines.append(f"    {sql_line}")
+        parts.append("\n".join(lines))
+
+    rendered = "\n\n" + ("\n" + "─" * 70 + "\n").join(parts) + "\n"
     return _FEW_SHOT_HEADER.format(examples=rendered)
 
 
