@@ -130,6 +130,98 @@ def _rewrite_sql(sql: str, corrections: Dict[Tuple[str, str], str]) -> str:
     return result
 
 
+# ── Column synonym map ───────────────────────────────────────────────────────
+# Maps common invented column names → the real DB column they likely represent.
+# Used to generate intelligent suggestions when the LLM hallucinates a column.
+_COLUMN_SYNONYMS: Dict[str, str] = {
+    # ── segment / category family ──────────────────────────────────────────
+    "segment":           "category",
+    "product_segment":   "category",
+    "segments":          "category",
+    "segment_name":      "category",
+    "product_category":  "category",
+    "item_category":     "category",
+    "category_name":     "category",
+    # ── sub_category ──────────────────────────────────────────────────────
+    "sub_segment":       "sub_category",
+    "subsegment":        "sub_category",
+    "subcategory":       "sub_category",
+    # ── manufacturer ──────────────────────────────────────────────────────
+    "company":           "manufacturer",
+    "manufacturer_name": "manufacturer",
+    "mfr":               "manufacturer",
+    "supplier":          "manufacturer",
+    "vendor":            "manufacturer",
+    "maker":             "manufacturer",
+    # ── brand ─────────────────────────────────────────────────────────────
+    "product":           "brand",
+    "brand_name":        "brand",
+    "item":              "brand",
+    "sku":               "brand",
+    "product_name":      "brand",
+    # ── subbrand ──────────────────────────────────────────────────────────
+    "sub_brand":         "subbrand",
+    "subbrand_name":     "subbrand",
+    "variant":           "subbrand",
+    "sub_brand_name":    "subbrand",
+    # ── market / geography ────────────────────────────────────────────────
+    "region":            "market",
+    "geography":         "market",
+    "geo":               "market",
+    "market_name":       "market",
+    "area":              "market",
+    "territory":         "market",
+    # ── customer / retailer ───────────────────────────────────────────────
+    "retailer":          "customer",
+    "store":             "customer",
+    "account":           "customer",
+    "channel":           "customer",
+    "customer_name":     "customer",
+    "outlet":            "customer",
+    # ── mega_category ─────────────────────────────────────────────────────
+    "department":        "mega_category",
+    "mega_cat":          "mega_category",
+    "super_category":    "mega_category",
+    "aisle":             "mega_category",
+    # ── division ──────────────────────────────────────────────────────────
+    "division_name":     "division",
+    # ── ppg ───────────────────────────────────────────────────────────────
+    "ppg_name":          "ppg",
+    "product_group":     "ppg",
+    "planning_group":    "ppg",
+}
+
+_KNOWN_DB_COLUMNS: set = {
+    "mega_category", "manufacturer", "category", "sub_category",
+    "brand", "subbrand", "ppg", "market", "customer", "division",
+}
+
+
+def _suggest_column(col_name: str) -> Optional[str]:
+    """
+    Given an invented / hallucinated column name, return the most likely real
+    DB column.  Checks the synonym table first, then falls back to substring
+    matching against known columns.
+    """
+    key = col_name.lower().strip()
+
+    # 1. Direct synonym lookup
+    if key in _COLUMN_SYNONYMS:
+        return _COLUMN_SYNONYMS[key]
+
+    # 2. Alias appears inside the invented name  (e.g. "product_segment" ∋ "segment")
+    for alias, real in _COLUMN_SYNONYMS.items():
+        if alias in key:
+            return real
+
+    # 3. Known DB column name appears inside the invented name
+    for real_col in _KNOWN_DB_COLUMNS:
+        if real_col in key:
+            return real_col
+
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DB helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -196,8 +288,64 @@ def _resolve_one(
 ) -> dict:
     """Ask the LLM to resolve a single filter value.  Returns parsed JSON dict."""
     if not db_values:
-        return {"match": guessed, "confidence": 0.0, "clarify": True,
-                "question": f"Could not find column '{column}' in the database."}
+        # Column doesn't exist — try to suggest the closest real column.
+        suggested = _suggest_column(column)
+        if suggested:
+            suggested_values = _fetch_distinct(suggested)
+            if suggested_values:
+                # Try exact match first
+                lower_map = {v.lower(): v for v in suggested_values}
+                if guessed.lower() in lower_map:
+                    best = lower_map[guessed.lower()]
+                    return {
+                        "match": guessed, "confidence": 0.0, "clarify": True,
+                        "question": (
+                            f"There's no column named **{column}** in the database — "
+                            f"did you mean **{suggested}** = '{best}'?"
+                        ),
+                    }
+                # Ask LLM to find best match in the suggested column
+                values_str = "\n".join(f"  - {v}" for v in suggested_values[:_MAX_DISTINCT])
+                try:
+                    resp = llm.invoke([
+                        {"role": "system", "content": _RESOLVER_SYSTEM},
+                        {"role": "user",   "content": _RESOLVER_USER.format(
+                            column=suggested, guessed=guessed, db_values=values_str
+                        )},
+                    ])
+                    raw = resp.content.strip()
+                    raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
+                    raw = raw.replace("```", "").strip()
+                    result = json.loads(raw)
+                    best  = result.get("match") or guessed
+                    conf  = float(result.get("confidence", 0.0))
+                    question = (
+                        f"There's no column named **{column}** in the database. "
+                        f"Did you mean **{suggested}** = '{best}'?"
+                        + (f" (confidence: {conf:.0%})" if conf < 0.9 else "")
+                    )
+                    return {
+                        "match": guessed, "confidence": 0.0, "clarify": True,
+                        "question": question,
+                    }
+                except Exception as exc:
+                    logger.warning(f"FilterResolver: suggestion LLM failed — {exc}")
+                    return {
+                        "match": guessed, "confidence": 0.0, "clarify": True,
+                        "question": (
+                            f"There's no column named **{column}** in the database — "
+                            f"did you mean **{suggested}**?"
+                        ),
+                    }
+        # No suggestion found — list available columns
+        cols = ", ".join(sorted(_KNOWN_DB_COLUMNS))
+        return {
+            "match": guessed, "confidence": 0.0, "clarify": True,
+            "question": (
+                f"I couldn't find a column named **{column}** in the database. "
+                f"Available filter columns are: {cols}."
+            ),
+        }
 
     # If guessed already in db_values (exact, case-insensitive) → skip LLM
     lower_map = {v.lower(): v for v in db_values}
