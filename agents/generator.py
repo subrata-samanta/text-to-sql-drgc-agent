@@ -357,6 +357,47 @@ class SQLGeneratorAgent:
 
         sql = sql.strip()
 
+        # ── Truncation guard ──────────────────────────────────────────────────
+        # If the LLM hit the max_tokens ceiling the SQL will be cut mid-query.
+        # Reliable heuristics (checked in order, OR-combined):
+        #
+        #   1. Unbalanced parentheses — any multi-CTE query truncated before its
+        #      final closing paren will have more '(' than ')'.
+        #
+        #   2. Last meaningful token is a mid-clause keyword that can never legally
+        #      end a SQL statement (AND, OR, WHERE, FROM, ON, JOIN, CASE, WHEN, …).
+        #
+        # Both checks are applied; if either fires the SQL is treated as truncated.
+        _open_parens  = sql.count("(")
+        _close_parens = sql.count(")")
+        _paren_unbalanced = _open_parens > _close_parens
+
+        # Strip trailing whitespace / semicolon to inspect the real last token
+        _sql_for_check = sql.rstrip().rstrip(";").rstrip()
+        _ends_mid_clause = bool(re.search(
+            r"\b(AND|OR|WHERE|FROM|JOIN|ON|CASE|WHEN|THEN|AS|BY|,)\s*$",
+            _sql_for_check, re.IGNORECASE,
+        ))
+
+        _looks_truncated = bool(sql) and (_paren_unbalanced or _ends_mid_clause)
+
+        if _looks_truncated:
+            reason = []
+            if _paren_unbalanced:
+                reason.append(f"unbalanced parens: {_open_parens} open vs {_close_parens} close")
+            if _ends_mid_clause:
+                reason.append("ends mid-clause")
+            logger.error(
+                f"Generator: SQL appears truncated ({'; '.join(reason)}) — "
+                f"likely hit max_tokens limit ({settings.dbrx_max_tokens}). "
+                f"Last 120 chars: ...{sql[-120:]!r}"
+            )
+            raise ValueError(
+                f"Generated SQL was truncated by the LLM token limit "
+                f"(max_tokens={settings.dbrx_max_tokens}). "
+                "Increase DBRX_MAX_TOKENS in .env and retry."
+            )
+
         # For dbrx: normalise any incorrect quoting of the fully-qualified table
         # name (LLMs sometimes emit single/double quotes instead of backticks).
         if settings.llm_provider.lower() == "dbrx":

@@ -95,6 +95,16 @@ if _IS_DBRX:
             "All entity columns will be attempted — UNRESOLVED_COLUMN errors may occur."
         )
 
+# True when we have confirmed table schema info AND at least one entity column
+# actually exists in the Databricks table — only then is entity validation
+# meaningful.  When False (schema unknown or all entity cols absent), the
+# entity check would always produce false-positive failures and must be skipped.
+_DBRX_ENTITY_VALIDATION_POSSIBLE: bool = (
+    not _IS_DBRX                              # groq: always validate
+    or not _DBRX_TABLE_COLS                   # dbrx: schema not yet known, try anyway
+    or any(col in _DBRX_TABLE_COLS for col, _ in ALL_ENTITY_COLUMNS)  # ≥1 col present
+)
+
 # ── Metric keyword → SQL patterns that should be present ─────────────────────
 METRIC_PATTERNS: Dict[str, List[str]] = {
     "market share": [r"sum\s*\(", r"/\s*sum\s*\(", r"market_share"],
@@ -415,7 +425,16 @@ def _validate_rule_based(question: str, sql: str) -> Tuple[bool, List[str]]:
     # Entities that exist in multiple columns (e.g. MONDELEZ as manufacturer
     # AND brand) always resolve to the FIRST matching column in the hierarchy
     # so the SQL must filter on that highest-priority column.
-    for entity in _extract_entity_candidates(question):
+    #
+    # For dbrx: if the Databricks table schema is known but none of the
+    # expected entity hierarchy columns exist, resolution is impossible and
+    # the check would always produce false-positive failures — skip entirely.
+    if not _DBRX_ENTITY_VALIDATION_POSSIBLE:
+        logger.debug(
+            "Validator: entity hierarchy check skipped — no entity columns "
+            "present in the Databricks table (schema mismatch)."
+        )
+    for entity in (_extract_entity_candidates(question) if _DBRX_ENTITY_VALIDATION_POSSIBLE else []):
         resolved = _resolve_entity_column(entity)   # already uppercased
 
         if resolved:
@@ -439,7 +458,18 @@ def _validate_rule_based(question: str, sql: str) -> Tuple[bool, List[str]]:
                         f"{col_label} — use: WHERE {col_name} = '{entity}'."
                     )
         else:
-            # Entity not found in any DB column; only flag in a filter context
+            # Entity not found in any DB column.
+            # For dbrx with known schema: if _resolve_entity_column returned None
+            # it means every entity column was skipped (not in table).  This is a
+            # schema-mismatch situation, not a SQL correctness problem — log and skip.
+            if _IS_DBRX and _DBRX_TABLE_COLS:
+                logger.debug(
+                    f"Validator: '{entity}' not resolved — all matching entity "
+                    "columns absent from Databricks table; skipping entity check."
+                )
+                continue
+            # For groq / unknown schema: only flag in a filter context to avoid
+            # noisy false positives on common English words.
             entity_in_sql = entity.upper() in sql_upper
             filter_context_words = [
                 "market", "brand", "manufacturer", "category", "segment",

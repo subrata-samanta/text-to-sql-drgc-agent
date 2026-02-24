@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     dbrx_base_url: str = Field(default="", env="DBRX_BASE_URL")
     dbrx_model: str = Field(default="databricks-gemini-2-5-flash", env="DBRX_MODEL")
     dbrx_temperature: float = Field(default=0.0, env="DBRX_TEMPERATURE")
-    dbrx_max_tokens: int = Field(default=2048, env="DBRX_MAX_TOKENS")
+    dbrx_max_tokens: int = Field(default=8192, env="DBRX_MAX_TOKENS")
 
     # ── Databricks SQL connection ─────────────────────────────────────────────
     databricks_server_hostname: str = Field(default="", env="DATABRICKS_SERVER_HOSTNAME")
