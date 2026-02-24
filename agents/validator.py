@@ -33,7 +33,6 @@ from loguru import logger
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from core.state import AgentState
-from config import settings
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -427,14 +426,9 @@ def _validate_rule_based(question: str, sql: str) -> Tuple[bool, List[str]]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _build_llm():
-    """Build a fast, cheap LLM for validation (uses the groq_model_fast slot)."""
-    from langchain_groq import ChatGroq
-    return ChatGroq(
-        model=settings.groq_model_fast,
-        groq_api_key=settings.groq_api_key,
-        temperature=0,
-        max_tokens=256,
-    )
+    """Build a fast, cheap LLM for validation."""
+    from core.llm_factory import create_llm
+    return create_llm("fast")
 
 
 _SYSTEM_PROMPT = """You are a SQL correctness auditor for a Nielsen POS analytics database.

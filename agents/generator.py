@@ -4,8 +4,8 @@ SQL Generator Agent: Translates logical plans into SQL queries.
 
 import re
 
-from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
+from core.llm_factory import create_llm
 from loguru import logger
 from core.state import AgentState
 from config import settings
@@ -185,11 +185,7 @@ class SQLGeneratorAgent:
     """
 
     def __init__(self):
-        self.llm = ChatGroq(
-            model=settings.groq_model_reasoning,
-            temperature=settings.groq_temperature,
-            groq_api_key=settings.groq_api_key
-        )
+        self.llm = create_llm("reasoning")
 
         self.generation_prompt = ChatPromptTemplate.from_messages([
             ("system", _BASE_SYSTEM),
@@ -306,7 +302,9 @@ class SQLGeneratorAgent:
         sql = sql.strip()
 
         # Auto-patch SQLite incompatible functions (YEAR, MONTH, QUARTER, etc.)
-        sql = _fix_sqlite_compat(sql)
+        # Only needed for local SQLite — skip when querying Databricks directly.
+        if settings.llm_provider.lower() != "dbrx":
+            sql = _fix_sqlite_compat(sql)
 
         return sql
 

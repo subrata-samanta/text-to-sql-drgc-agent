@@ -7,12 +7,12 @@ import os
 import sys
 from typing import List, Dict
 
-from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from loguru import logger
 
 from core.state import AgentState
 from config import settings
+from core.llm_factory import create_llm
 
 # ── Import the definitive Nielsen schema ─────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -146,11 +146,7 @@ class SchemaLinkerAgent:
     """
 
     def __init__(self):
-        self.llm = ChatGroq(
-            model=settings.groq_model_fast,
-            temperature=0,
-            groq_api_key=settings.groq_api_key,
-        )
+        self.llm = create_llm("fast")
 
         # ── Column-selection prompt ──────────────────────────────────────────
         self.column_selection_prompt = ChatPromptTemplate.from_messages([

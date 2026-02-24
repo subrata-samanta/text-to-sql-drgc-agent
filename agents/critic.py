@@ -2,12 +2,11 @@
 Critic Agent (Refiner): Validates, executes, and corrects SQL queries.
 """
 
-from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from loguru import logger
 from core.state import AgentState
 from core.database import db_manager
-from config import settings
+from core.llm_factory import create_llm
 
 
 class CriticAgent:
@@ -17,11 +16,7 @@ class CriticAgent:
     """
     
     def __init__(self):
-        self.llm = ChatGroq(
-            model=settings.groq_model_reasoning,
-            temperature=settings.groq_temperature,
-            groq_api_key=settings.groq_api_key
-        )
+        self.llm = create_llm("reasoning")
         
         # Prompt for error correction
         self.reflection_prompt = ChatPromptTemplate.from_messages([

@@ -32,10 +32,9 @@ from typing import Dict, List, Optional, Tuple
 
 import sqlglot
 import sqlglot.expressions as exp
-from langchain_groq import ChatGroq
+from core.llm_factory import create_llm
 from loguru import logger
 
-from config import settings
 from core.database import db_manager
 from core.state import AgentState
 
@@ -281,7 +280,7 @@ Return the JSON object now.
 
 
 def _resolve_one(
-    llm: ChatGroq,
+    llm,
     column: str,
     guessed: str,
     db_values: List[str],
@@ -383,11 +382,7 @@ class FilterResolverAgent:
     """
 
     def __init__(self):
-        self.llm = ChatGroq(
-            model=settings.groq_model_reasoning,
-            temperature=0,               # deterministic for matching
-            groq_api_key=settings.groq_api_key,
-        )
+        self.llm = create_llm("reasoning")
 
     def resolve(self, state: AgentState) -> dict:
         sql = state.get("sql_query", "")
