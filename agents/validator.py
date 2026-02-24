@@ -107,14 +107,12 @@ _DBRX_ENTITY_VALIDATION_POSSIBLE: bool = (
 
 # ── Metric keyword → SQL patterns that should be present ─────────────────────
 METRIC_PATTERNS: Dict[str, List[str]] = {
-    "market share": [r"sum\s*\(", r"/\s*sum\s*\(", r"market_share"],
-    "market_share": [r"sum\s*\(", r"/\s*sum\s*\(", r"market_share"],
-    "tdp":          [r"\btdp\b",  r"avg\s*\("],
-    "velocity":     [r"velocity", r"/\s*tdp", r"sales.*per.*tdp"],
-    "distribution": [r"\btdp\b",  r"distribution"],
-    "sales":        [r"sales",    r"sum\s*\("],
-    "volume":       [r"volume",   r"units", r"sum\s*\("],
-    "revenue":      [r"revenue",  r"sales", r"sum\s*\("],
+    # "market share" requires a ratio pattern (SUM/SUM) or a market_share column.
+    # Do NOT flag generic "sales", "volume", "revenue" — almost every valid
+    # Nielsen query aggregates those with SUM() and the false-positive rate is 100%.
+    "market share":  [r"/\s*sum\s*\(", r"market_share", r"OVER\s*\("],
+    "market_share":  [r"/\s*sum\s*\(", r"market_share", r"OVER\s*\("],
+    "velocity":      [r"velocity", r"/\s*tdp", r"sales.*per.*tdp"],
 }
 
 # Month name → zero-padded number
@@ -271,25 +269,35 @@ def _extract_entity_candidates(question: str) -> List[str]:
 
 def _entity_correctly_filtered_in_sql(col_name: str, entity: str, sql: str) -> bool:
     """
-    Return True when the SQL contains a WHERE-style filter using BOTH:
-      • the correct column name  (e.g.  manufacturer)
-      • the entity value         (e.g.  MONDELEZ)
+    Return True when the entity value appears as a quoted literal anywhere in
+    the SQL (regardless of which column it is associated with).
 
-    Matches patterns like:
-        WHERE manufacturer = 'MONDELEZ'
-        WHERE  manufacturer LIKE '%MONDELEZ%'
-        WHERE  manufacturer IN ('MONDELEZ', ...)
+    We use a permissive check rather than requiring the exact (col_name, value)
+    pair because:
+    - The filter_resolver may have already corrected the column cross-hierarchy
+      (e.g. category='OREO' → brand='OREO'), so the resolved col_name from
+      the DB lookup may not match what's in the corrected SQL.
+    - Mixed casing (DB stores 'Mondelez', LLM wrote 'MONDELEZ') is handled by
+      the upper-cased comparison.
+    - If the value is present as a quoted filter literal, the query is filtering
+      on it — which column it resolves to is the filter_resolver's job, not
+      the validator's.
 
-    Two-step check:
-      a. Quick gate: is the entity value present anywhere in the SQL?
-      b. Is col_name used in a comparison / membership expression?
+    Only returns False when the entity value is entirely absent from all quoted
+    string literals in the SQL — meaning it was never used as a filter at all.
     """
-    if entity.upper() not in sql.upper():
-        return False   # value completely absent
-
-    # col_name followed by a comparison or membership operator
-    col_pattern = rf"\b{re.escape(col_name)}\b\s*(=|like|in\s*\()"
-    return bool(re.search(col_pattern, sql, re.IGNORECASE))
+    entity_upper = entity.upper()
+    # Find all single-quoted string literals in the SQL and check case-insensitively
+    quoted_literals = re.findall(r"'([^']*)'" , sql)
+    if any(entity_upper in lit.upper() for lit in quoted_literals):
+        return True
+    # Also accept a table/col reference that has the entity inline (LIKE patterns)
+    return entity_upper in sql.upper() and bool(
+        re.search(
+            rf"\b{re.escape(col_name)}\b\s*(=|like|in\s*\()",
+            sql, re.IGNORECASE,
+        )
+    )
 
 
 def resolve_entities_in_question(question: str) -> Dict[str, Tuple[str, str]]:
@@ -422,64 +430,45 @@ def _validate_rule_based(question: str, sql: str) -> Tuple[bool, List[str]]:
             )
 
     # ── 3. Hierarchy entity alignment ────────────────────────────────────────
-    # Entities that exist in multiple columns (e.g. MONDELEZ as manufacturer
-    # AND brand) always resolve to the FIRST matching column in the hierarchy
-    # so the SQL must filter on that highest-priority column.
+    # Verify that each named entity from the question appears as a quoted
+    # filter literal somewhere in the SQL.  We deliberately do NOT enforce
+    # which column it is filtered on — that is the filter_resolver's job.
+    # Checking column-priority here produces false positives when:
+    #   • filter_resolver corrected a cross-hierarchy column (category → brand)
+    #   • The DB holds mixed-case values the LLM uppercased or vice-versa
+    #   • The resolved col_name from the DB doesn't match the corrected SQL
     #
-    # For dbrx: if the Databricks table schema is known but none of the
-    # expected entity hierarchy columns exist, resolution is impossible and
-    # the check would always produce false-positive failures — skip entirely.
+    # Skip entirely for dbrx when no entity columns are in the table schema.
     if not _DBRX_ENTITY_VALIDATION_POSSIBLE:
         logger.debug(
-            "Validator: entity hierarchy check skipped — no entity columns "
-            "present in the Databricks table (schema mismatch)."
+            "Validator: entity check skipped — no entity columns in Databricks table."
         )
     for entity in (_extract_entity_candidates(question) if _DBRX_ENTITY_VALIDATION_POSSIBLE else []):
-        resolved = _resolve_entity_column(entity)   # already uppercased
-
+        resolved = _resolve_entity_column(entity)
         if resolved:
             col_name, col_label = resolved
-            correctly_filtered = _entity_correctly_filtered_in_sql(col_name, entity, sql)
-
-            if not correctly_filtered:
-                entity_in_sql = entity.upper() in sql_upper
-                if not entity_in_sql:
-                    issues.append(
-                        f"'{entity}' ({col_label}) is mentioned in the question "
-                        f"but is missing from the SQL. "
-                        f"Expected: WHERE {col_name} = '{entity}'."
-                    )
-                else:
-                    # Value present but under the wrong column (hierarchy mismatch)
-                    issues.append(
-                        f"'{entity}' appears in the SQL but is NOT filtered on "
-                        f"the correct column '{col_name}' ({col_label}). "
-                        f"In the Nielsen hierarchy '{entity}' resolves to "
-                        f"{col_label} — use: WHERE {col_name} = '{entity}'."
-                    )
-        else:
-            # Entity not found in any DB column.
-            # For dbrx with known schema: if _resolve_entity_column returned None
-            # it means every entity column was skipped (not in table).  This is a
-            # schema-mismatch situation, not a SQL correctness problem — log and skip.
-            if _IS_DBRX and _DBRX_TABLE_COLS:
-                logger.debug(
-                    f"Validator: '{entity}' not resolved — all matching entity "
-                    "columns absent from Databricks table; skipping entity check."
-                )
-                continue
-            # For groq / unknown schema: only flag in a filter context to avoid
-            # noisy false positives on common English words.
-            entity_in_sql = entity.upper() in sql_upper
-            filter_context_words = [
-                "market", "brand", "manufacturer", "category", "segment",
-                "customer", "division", "channel", "product",
-            ]
-            if not entity_in_sql and any(kw in q_lower for kw in filter_context_words):
+            if not _entity_correctly_filtered_in_sql(col_name, entity, sql):
                 issues.append(
-                    f"'{entity}' from the question is not referenced in the SQL "
-                    f"and could not be matched to any known hierarchy column."
+                    f"'{entity}' ({col_label}) is mentioned in the question "
+                    f"but does not appear as a filter value in the SQL. "
+                    f"Add a filter such as: WHERE {col_name} = '{entity}'."
                 )
+        else:
+            # Entity not resolved — schema mismatch on dbrx, silently skip.
+            if _IS_DBRX and _DBRX_TABLE_COLS:
+                continue
+            # For groq: only flag if entity is completely absent from SQL AND
+            # the question has clear filter intent.
+            if entity.upper() not in sql.upper():
+                filter_context_words = [
+                    "market", "brand", "manufacturer", "category", "segment",
+                    "customer", "division", "channel", "product",
+                ]
+                if any(kw in q_lower for kw in filter_context_words):
+                    issues.append(
+                        f"'{entity}' from the question is not referenced in the SQL "
+                        f"and could not be matched to any known hierarchy column."
+                    )
 
     # ── 4. Metric alignment ───────────────────────────────────────────────────
     for metric_kw, sql_patterns in METRIC_PATTERNS.items():
@@ -629,17 +618,9 @@ class SQLValidatorAgent:
                 "sql_validation_attempts": attempts + 1,
             }
 
-        # ── Step 2: LLM semantic check ────────────────────────────────────────
-        llm_passed, llm_issues = _validate_with_llm(question, sql)
-
-        if not llm_passed:
-            logger.warning(f"SQL Validator: LLM check FAILED: {llm_issues}")
-            return {
-                "validation_passed": False,
-                "validation_issues": llm_issues,
-                "sql_validation_attempts": attempts + 1,
-            }
-
+        # LLM semantic check intentionally removed — adds latency and produces
+        # false positives. The critic agent handles semantic correctness after
+        # SQL execution.
         logger.info("SQL Validator: validation PASSED")
         return {
             "validation_passed": True,

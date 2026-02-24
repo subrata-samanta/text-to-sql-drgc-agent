@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     enable_self_correction: bool = Field(default=True, env="ENABLE_SELF_CORRECTION")
     enable_dynamic_few_shot: bool = Field(default=True, env="ENABLE_DYNAMIC_FEW_SHOT")
     few_shot_examples_count: int = Field(default=3, env="FEW_SHOT_EXAMPLES_COUNT")
+    # Set to false to skip the rule-based SQL validator and rely solely on the
+    # executor + critic for correctness (faster, fewer false positives).
+    enable_sql_validator: bool = Field(default=True, env="ENABLE_SQL_VALIDATOR")
     query_timeout_seconds: int = Field(default=30, env="QUERY_TIMEOUT_SECONDS")
 
     class Config:

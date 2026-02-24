@@ -272,11 +272,13 @@ def build_graph() -> StateGraph:
         lambda s: "clarify" if s.get("needs_clarification") else "validate",
         {
             "clarify":  "direct_respond",
-            "validate": "sql_validator",
+            # When sql_validator is disabled, route straight to executor;
+            # the critic agent handles any execution-time errors instead.
+            "validate": "sql_validator" if settings.enable_sql_validator else "executor",
         },
     )
 
-    # Validation gate
+    # Validation gate (only reached when enable_sql_validator=True)
     # "regenerate" loops back to generator — schema/few-shot/plan already in state,
     # so context_builder is NOT re-run (no redundant fetching).
     workflow.add_conditional_edges(
