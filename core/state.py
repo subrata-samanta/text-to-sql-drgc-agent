@@ -23,6 +23,7 @@ class AgentState(TypedDict):
     
     # Schema Retrieval Phase
     relevant_tables: Optional[List[str]]  # Selected table names
+    relevant_schema_categories: Optional[List[str]]  # Schema category groups chosen by Planner
     schema_context: Optional[str]  # DDL/Schema info for relevant tables
     schema_metadata: Optional[Dict[str, Any]]  # Additional metadata
     

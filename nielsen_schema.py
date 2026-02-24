@@ -237,3 +237,54 @@ schema = {
     }
   }
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Schema category utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Lightweight mapping: category → list of column names (no descriptions).
+# Used by the Planner to decide which categories are relevant before building
+# the full schema context that gets passed to the SQL Generator.
+CATEGORIES_SUMMARY: dict = {
+    category: list(cols.keys())
+    for category, cols in schema["columns"].items()
+}
+
+# Human-readable one-liner per category — injected into the planner prompt so
+# the LLM can pick categories without seeing full column descriptions.
+CATEGORIES_DESCRIPTION: dict = {
+    "temporal":           "Date/time columns: period_date, year_month, quarter_nielsen, year_nielsen",
+    "geographic":         "Location/channel columns: market, total, customer, division",
+    "category_hierarchy": "Product taxonomy columns: mega_category, category, sub_category",
+    "product_hierarchy":  "Brand/product columns: manufacturer, brand, subbrand, ppg, product_name, upc, pack, pack_type",
+    "base_metrics":       "Core KPI columns: sales_dollar, sales_units, sales_lbs, tdp, display",
+    "promotional_dollar": "Promo-split dollar metrics: sales_dollar_without_promo, sales_dollar_with_any_promo, incremental_sales_dollar_due_to_promo, …",
+    "promotional_units":  "Promo-split unit metrics: sales_units_without_promo, sales_units_with_any_promo, incremental_sales_units_due_to_promo, …",
+    "promotional_tdp":    "Promo-split TDP metrics: tdp_with_any_promo, tdp_with_feature_and_display, tdp_with_display, …",
+}
+
+ALL_CATEGORIES = list(schema["columns"].keys())
+
+
+def get_schema_for_categories(categories: list[str]) -> str:
+    """
+    Build a structured schema text containing ONLY the requested category groups.
+
+    Args:
+        categories: List of category keys from CATEGORIES_SUMMARY
+                    (e.g. ['temporal', 'geographic', 'base_metrics'])
+
+    Returns:
+        Formatted schema string ready to be injected into an LLM prompt.
+    """
+    table_name = schema["table"]
+    all_cols = schema["columns"]
+    lines = [f"TABLE: {table_name}", "=" * 70]
+    for cat in categories:
+        cat = cat.strip().lower()
+        if cat not in all_cols:
+            continue
+        lines.append(f"\n── {cat.upper().replace('_', ' ')} ──")
+        for col_name, description in all_cols[cat].items():
+            lines.append(f"  • {col_name}:{description}")
+    return "\n".join(lines)

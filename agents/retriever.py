@@ -16,7 +16,11 @@ from config import settings
 
 # ── Import the definitive Nielsen schema ─────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from nielsen_schema import schema as NIELSEN_SCHEMA           # noqa: E402
+from nielsen_schema import (                                   # noqa: E402
+    schema as NIELSEN_SCHEMA,
+    get_schema_for_categories,
+    ALL_CATEGORIES,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Schema helpers (computed once at import time)
@@ -163,26 +167,39 @@ COLUMN SELECTION RULES
 Return ONLY the column names strictly needed, as a comma-separated list.
 No explanations. No extra text.
 
-GEOGRAPHIC PRIORITY (pick exactly ONE group):
-  • customer  named → include: customer
-  • division  named → include: division
-  • market    named → include: market
-  • default         → include: total
+────────────────────────────────────────────────────────────────────────
+DOMAIN KEYWORD DISAMBIGUATION  (resolve BEFORE choosing any column)
+────────────────────────────────────────────────────────────────────────
+Some phrases describe the analytical domain (= which METRIC to use), NOT a
+geographic filter.  Map them to metric columns — do NOT include them as filter
+columns (customer / division / market).
+
+  "Distribution & Availability" → tdp         (NOT a division filter)
+  "Distribution" (as topic)    → tdp
+  "Availability" (as topic)    → tdp
+  "TDP" / "Total Distribution" → tdp
+  "Sales" / "Revenue"          → sales_dollar
+  "Volume" / "Units"           → sales_units
+  "Velocity" / "Rate of Sale"  → sales_units + tdp
+  "Display" / "Merchandising"  → display
+  "Promo" / "Promotional"      → promotional_* columns matching the metric type
+
+────────────────────────────────────────────────────────────────────────
+GEOGRAPHIC FILTER  (pick exactly ONE based on strict naming patterns)
+────────────────────────────────────────────────────────────────────────
+Only apply a geographic column when the value matches the pattern.
+Never force-fit a domain phrase into a geographic column.
+
+  customer → value ends with " TA"            e.g. "Walmart Total US TA"
+  division → value ends with " Division xAOC" e.g. "South Atlantic Division xAOC"
+  market   → value ends with " SMM xAOC"      e.g. "New York SMM xAOC"
+  default  → total = 'Total US xAOC + Conv'   (use when none of the above match)
 
 TEMPORAL RULES:
   • weekly / specific week    → period_date
   • monthly / multi-month     → year_month
   • quarterly                 → quarter_nielsen  (+ year_nielsen)
   • annual / YTD              → year_nielsen     (+ year_month for YTD)
-
-METRIC RULES:
-  • "sales" / "revenue"       → sales_dollar
-  • "units"                   → sales_units
-  • "TDP" / "distribution"    → tdp
-  • "velocity"                → sales_units, tdp
-  • "display"                 → display
-  • market share              → sales_dollar  (both numerator & denominator)
-  • promotional question      → relevant sales_dollar_with_* / sales_units_with_*
 
 Always include: one temporal column + one geographic column + metric column(s).
 
@@ -202,22 +219,103 @@ Comma-separated column names only:"""),
     # Internal helpers
     # ─────────────────────────────────────────────────────────────────────────
 
-    def select_columns(self, question: str, plan: str) -> List[str]:
+    def select_columns(
+        self,
+        question: str,
+        plan: str,
+        candidate_schema_text: str | None = None,
+        candidate_columns: List[str] | None = None,
+    ) -> List[str]:
         """
         Ask the LLM which columns are needed; validate against the real schema.
+
+        Args:
+            question: User question.
+            plan: Logical plan from the Planner.
+            candidate_schema_text: Pre-filtered schema text (from planner categories).
+                                   Falls back to FULL_SCHEMA_TEXT when None.
+            candidate_columns: Pre-filtered column list to select from.
+                               Falls back to ALL_COLUMNS when None.
 
         Returns:
             List of valid column names from NIELSEN_SCHEMA.
         """
+        schema_text = candidate_schema_text or FULL_SCHEMA_TEXT
+        columns     = candidate_columns    or ALL_COLUMNS
         try:
-            chain = self.column_selection_prompt | self.llm
+            # Rebuild the prompt dynamically so the LLM only sees the relevant columns
+            dynamic_prompt = ChatPromptTemplate.from_messages([
+                ("system", f"""You are a Nielsen POS data expert. The database contains exactly ONE table:
+
+  Table: {TABLE_NAME}
+
+FILTERED SCHEMA (only categories relevant to this query):
+{schema_text}
+
+══════════════════════════════════════════════════════════════════════════
+COLUMN SELECTION RULES
+══════════════════════════════════════════════════════════════════════════
+Return ONLY the column names strictly needed, as a comma-separated list.
+No explanations. No extra text.
+
+──────────────────────────────────────────────────────────────────────────
+DOMAIN KEYWORD DISAMBIGUATION  (resolve BEFORE choosing any column)
+──────────────────────────────────────────────────────────────────────────
+Some phrases describe the analytical domain (= which METRIC to use), NOT a
+geographic filter.  Map them to metric columns — do NOT include them as filter
+columns (customer / division / market).
+
+  "Distribution & Availability" → tdp         (NOT a division filter)
+  "Distribution" (as topic)    → tdp
+  "Availability" (as topic)    → tdp
+  "TDP" / "Total Distribution" → tdp
+  "Sales" / "Revenue"          → sales_dollar
+  "Volume" / "Units"           → sales_units
+  "Velocity" / "Rate of Sale"  → sales_units + tdp
+  "Display" / "Merchandising"  → display
+  "Promo" / "Promotional"      → promotional_* columns matching the metric type
+
+──────────────────────────────────────────────────────────────────────────
+GEOGRAPHIC FILTER  (classify by entity TYPE, not by exact string pattern)
+──────────────────────────────────────────────────────────────────────────
+Users write natural names; the filter resolver maps them to exact DB values.
+Choose the geographic column based on what TYPE of entity the user named:
+
+  customer → a retailer, store chain, or retail channel
+              ("Walmart", "Target", "Kroger", "Club", "Dollar General", "Mass", "eComm")
+  division → a U.S. geographic division or sales region
+              ("South Atlantic", "Mountain", "Pacific", "New England", "Midwest")
+  market   → a specific metro area, city, or DMA
+              ("New York", "Los Angeles", "Chicago", "Dallas")
+  default  → total = 'Total US xAOC + Conv'  (no retailer/division/market mentioned)
+
+TEMPORAL RULES:
+  • weekly / specific week    → period_date
+  • monthly / multi-month     → year_month
+  • quarterly                 → quarter_nielsen  (+ year_nielsen)
+  • annual / YTD              → year_nielsen     (+ year_month for YTD)
+
+Always include: one temporal column + one geographic column + metric column(s).
+
+EXAMPLE:
+  Question: "What was OREO brand dollar market share in Q3 2024?"
+  Response: year_month, quarter_nielsen, year_nielsen, total, brand, category, sales_dollar"""),
+                ("user", """Question: {{question}}
+
+Plan: {{plan}}
+
+All available columns: {{all_columns}}
+
+Comma-separated column names only:"""),
+            ])
+            chain = dynamic_prompt | self.llm
             response = chain.invoke({
-                "question": question,
-                "plan": plan,
-                "all_columns": ", ".join(ALL_COLUMNS),
+                "question":    question,
+                "plan":        plan,
+                "all_columns": ", ".join(columns),
             })
             selected = [c.strip() for c in response.content.split(",")]
-            # Keep only names that actually exist in the schema
+            # Keep only names that actually exist in the full schema
             selected = [c for c in selected if c in ALL_COLUMNS]
             logger.info(f"Schema linker selected {len(selected)} columns: {selected}")
             return selected or ["year_month", "total", "sales_dollar"]
@@ -257,8 +355,32 @@ Comma-separated column names only:"""),
         question: str = state["question"]
         plan: str     = state.get("plan", "")
 
+        # ── Use planner-selected categories to pre-filter schema ──────────────
+        planner_categories: List[str] = state.get("relevant_schema_categories") or ALL_CATEGORIES
+        valid_categories = [c for c in planner_categories if c in ALL_CATEGORIES]
+        if not valid_categories:
+            valid_categories = ALL_CATEGORIES
+
+        if valid_categories != ALL_CATEGORIES:
+            logger.info(f"SCHEMA LINKER: Using planner-selected categories → {valid_categories}")
+        else:
+            logger.info("SCHEMA LINKER: No category pre-filter — using full schema")
+
+        # Build per-category filtered schema text + restricted column list
+        filtered_schema_text = get_schema_for_categories(valid_categories)
+        candidate_cols: List[str] = [
+            col
+            for cat in valid_categories
+            for col in _COLUMNS.get(cat, {}).keys()
+        ]
+
         try:
-            selected_cols = self.select_columns(question, plan)
+            selected_cols = self.select_columns(
+                question,
+                plan,
+                candidate_schema_text=filtered_schema_text,
+                candidate_columns=candidate_cols,
+            )
 
             # Targeted schema for the selected columns + obligatory CTE rules
             schema_context = self._build_targeted_schema(selected_cols) + CTE_CONVENTIONS
