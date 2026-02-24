@@ -817,6 +817,42 @@ def _resolve_hierarchy_entity(
     candidates.sort(key=lambda x: x["combined"], reverse=True)
     top = candidates[0]
 
+    # ── Perfect-match guard ────────────────────────────────────────────────
+    # If a candidate at the SAME level as sql_column has an exact or near-exact
+    # string match (s_score >= 0.90, i.e. identical casing-normalised or a
+    # single-character typo), use it immediately — do NOT attempt any
+    # cross-level promotion via Phase 3 or Phase 4.
+    #
+    # This prevents a correctly-placed filter (e.g. mega_category='CHOCOLATE')
+    # from being demoted to a finer level (category/sub_category/brand) purely
+    # because the intent classifier inferred a finer granularity and boosted
+    # their Level-alignment score above the exact mega_category hit.
+    sql_col_best: Optional[dict] = None
+    for cand in candidates:
+        if cand["level"] == sql_column and cand["s_score"] >= 0.90:
+            if sql_col_best is None or cand["s_score"] > sql_col_best["s_score"]:
+                sql_col_best = cand
+
+    if sql_col_best is not None:
+        corrected_val  = sql_col_best["value"]
+        interp = (
+            f"Interpreted **'{guessed}'** as **{sql_column}** = '**{corrected_val}**'"
+            if corrected_val.upper() != guessed.upper() else None
+        )
+        logger.info(
+            f"FilterResolver: perfect-match guard — keeping '{guessed}' at "
+            f"'{sql_column}' -> '{corrected_val}' "
+            f"(s_score={sql_col_best['s_score']:.2f}); skipping cross-level phases"
+        )
+        return {
+            "match":          corrected_val,
+            "matched_column": sql_column,
+            "confidence":     sql_col_best["combined"],
+            "clarify":        False,
+            "question":       None,
+            "interpretation": interp,
+        }
+
     # Phase 3: hierarchy consistency — prefer coarser if top is finer than intended
     top_idx      = hierarchy.index(top["level"]) if top["level"] in hierarchy else 0
     intended_idx = hierarchy.index(intended_level) if intended_level in hierarchy else 0

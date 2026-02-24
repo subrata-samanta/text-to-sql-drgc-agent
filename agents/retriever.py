@@ -5,7 +5,8 @@ and builds rich schema context (with CTE SQL conventions) for SQL generation.
 
 import os
 import sys
-from typing import List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional, Tuple
 
 from langchain_core.prompts import ChatPromptTemplate
 from loguru import logger
@@ -95,6 +96,78 @@ def _flat_column_list() -> List[str]:
 
 FULL_SCHEMA_TEXT: str  = _build_full_schema_text()
 ALL_COLUMNS: List[str] = _flat_column_list()
+
+# ── Columns for which sample DB values are fetched and injected into context ──
+# Only STRING / categorical columns are included — numeric metrics and raw
+# date/integer columns are deliberately excluded (their values aren't useful
+# as filter examples and can be very large).
+_CATEGORICAL_COLUMNS: frozenset = frozenset({
+    # Geographic
+    "market", "total", "customer", "division",
+    # Category hierarchy
+    "mega_category", "category", "sub_category",
+    # Product hierarchy
+    "manufacturer", "brand", "subbrand", "ppg",
+    # Temporal (small fixed set)
+    "quarter_nielsen",
+})
+
+
+def _fetch_column_examples(columns: List[str], n: int = 8) -> Dict[str, List[str]]:
+    """
+    Fetch up to ``n`` distinct non-null sample values for each column in
+    ``columns`` using a parallel DB query strategy (one query per column).
+
+    - Silently returns [] for any column that errors or returns no rows.
+    - Results are returned in a {col_name: [val, ...]} dict.
+    """
+    from core.database import db_manager
+
+    def _fetch(col: str) -> Tuple[str, List[str]]:
+        if settings.llm_provider.lower() == "dbrx":
+            sql = (
+                f"SELECT DISTINCT {col} FROM {_TABLE_REF} "
+                f"WHERE {col} IS NOT NULL LIMIT {n}"
+            )
+        else:
+            sql = (
+                f"SELECT DISTINCT {col} FROM {_TABLE_REF} "
+                f"WHERE {col} IS NOT NULL AND CAST({col} AS TEXT) != '' "
+                f"LIMIT {n}"
+            )
+        rows, err, _ = db_manager.execute_query(sql)
+        if err or not rows:
+            return col, []
+        vals: List[str] = []
+        for row in rows:
+            # Case-insensitive key lookup (Databricks may return upper-cased keys)
+            val = None
+            if col in row:
+                val = row[col]
+            else:
+                lower_col = col.lower()
+                for k, v in row.items():
+                    if k.lower() == lower_col:
+                        val = v
+                        break
+            if val is not None:
+                vals.append(str(val))
+        return col, vals
+
+    results: Dict[str, List[str]] = {}
+    if not columns:
+        return results
+    with ThreadPoolExecutor(max_workers=min(len(columns), 8)) as ex:
+        futures = {ex.submit(_fetch, col): col for col in columns}
+        for future in as_completed(futures):
+            col = futures[future]
+            try:
+                _, vals = future.result()
+                results[col] = vals
+            except Exception as exc:
+                logger.warning(f"Schema examples: fetch failed for '{col}' — {exc}")
+                results[col] = []
+    return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -340,9 +413,18 @@ Comma-separated column names only:"""),
             logger.error(f"Column selection error: {e}")
             return ["year_month", "total", "sales_dollar"]
 
-    def _build_targeted_schema(self, columns: List[str]) -> str:
+    def _build_targeted_schema(
+        self,
+        columns: List[str],
+        schema_metadata: Optional[Dict[str, dict]] = None,
+    ) -> str:
         """
         Build a concise schema text block containing ONLY the selected columns.
+
+        If ``schema_metadata`` contains an ``examples`` list for a column the
+        sample values are rendered on a dedicated line directly after the
+        column description so the generator LLM can write correct literals
+        without guessing.
         """
         lines = [f"TABLE: {_TABLE_REF}", "=" * 70]
         for group, cols in _COLUMNS.items():
@@ -351,6 +433,11 @@ Comma-separated column names only:"""),
                 lines.append(f"\n── {group.upper().replace('_', ' ')} ──")
                 for col_name, desc in relevant.items():
                     lines.append(f"  • {col_name}:{desc}")
+                    if schema_metadata:
+                        examples = schema_metadata.get(col_name, {}).get("examples", [])
+                        if examples:
+                            examples_str = ", ".join(f"'{v}'" for v in examples)
+                            lines.append(f"    ↳ sample values: {examples_str}")
         return "\n".join(lines)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -401,10 +488,7 @@ Comma-separated column names only:"""),
                 candidate_columns=candidate_cols,
             )
 
-            # Targeted schema for the selected columns + obligatory CTE rules
-            schema_context = self._build_targeted_schema(selected_cols) + CTE_CONVENTIONS
-
-            # Column-level metadata dict for state
+            # ── Build base schema_metadata (group + description) ──────────────
             schema_metadata: Dict[str, dict] = {}
             for group, cols in _COLUMNS.items():
                 for col_name, desc in cols.items():
@@ -414,9 +498,36 @@ Comma-separated column names only:"""),
                             "description": desc.strip(),
                         }
 
+            # ── Fetch sample values for categorical columns ────────────────────
+            # Run in parallel (one DB query per column); errors are silenced.
+            cat_cols = [c for c in selected_cols if c in _CATEGORICAL_COLUMNS]
+            if cat_cols:
+                logger.debug(
+                    f"Schema examples: fetching sample values for "
+                    f"{len(cat_cols)} categorical column(s): {cat_cols}"
+                )
+                examples_map = _fetch_column_examples(cat_cols)
+                for col, examples in examples_map.items():
+                    if col in schema_metadata and examples:
+                        schema_metadata[col]["examples"] = examples
+                logger.debug(
+                    "Schema examples: "
+                    + ", ".join(
+                        f"{c}({len(examples_map.get(c,[]))})"
+                        for c in cat_cols
+                    )
+                )
+
+            # ── Build schema_context with examples embedded ────────────────────
+            schema_context = (
+                self._build_targeted_schema(selected_cols, schema_metadata)
+                + CTE_CONVENTIONS
+            )
+
             logger.info(
                 f"Schema context ready — table='{_TABLE_REF}', "
-                f"columns selected={len(selected_cols)}"
+                f"columns selected={len(selected_cols)}, "
+                f"columns with examples={sum(1 for m in schema_metadata.values() if m.get('examples'))}"
             )
 
             return {
