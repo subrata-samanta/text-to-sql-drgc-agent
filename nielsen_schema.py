@@ -266,18 +266,21 @@ CATEGORIES_DESCRIPTION: dict = {
 ALL_CATEGORIES = list(schema["columns"].keys())
 
 
-def get_schema_for_categories(categories: list[str]) -> str:
+def get_schema_for_categories(categories: list[str], table_name_override: str = None) -> str:
     """
     Build a structured schema text containing ONLY the requested category groups.
 
     Args:
         categories: List of category keys from CATEGORIES_SUMMARY
                     (e.g. ['temporal', 'geographic', 'base_metrics'])
+        table_name_override: Optional table name to display in the header.
+                             When provided (e.g. a fully-qualified Databricks name)
+                             it replaces the default schema["table"] value.
 
     Returns:
         Formatted schema string ready to be injected into an LLM prompt.
     """
-    table_name = schema["table"]
+    table_name = table_name_override or schema["table"]
     all_cols = schema["columns"]
     lines = [f"TABLE: {table_name}", "=" * 70]
     for cat in categories:

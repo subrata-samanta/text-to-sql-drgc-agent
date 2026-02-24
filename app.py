@@ -7,10 +7,15 @@ from loguru import logger
 
 from graph import stream_agent_steps, stream_nl_response, NODE_LABELS
 from agents.interaction import DATA_INTENTS
+from agents.filter_resolver import initialize_value_cache
 from tools import seed_examples, semantic_cache, few_shot_retriever
 from core.database import db_manager
 from core.data_loader import DataLoader
 from config import settings
+
+# Pre-warm the filter-resolver value cache in the background so it is ready
+# before the first user query arrives (idempotent — safe across Streamlit reruns).
+initialize_value_cache()
 
 # ─── page config ──────────────────────────────────────────────────────────────────
 st.set_page_config(

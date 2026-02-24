@@ -212,6 +212,9 @@ async def startup_event():
     logger.info(f"Database: {settings.database_uri}")
     logger.info(f"Semantic Cache: {'Enabled' if settings.enable_semantic_cache else 'Disabled'}")
     logger.info(f"Few-Shot Learning: {'Enabled' if settings.enable_dynamic_few_shot else 'Disabled'}")
+    # Pre-build the filter-resolver value cache so the first query is never delayed.
+    from agents.filter_resolver import initialize_value_cache
+    initialize_value_cache()
 
 
 # Shutdown event

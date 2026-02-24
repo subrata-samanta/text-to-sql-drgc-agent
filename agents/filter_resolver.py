@@ -1,33 +1,62 @@
 """
-Filter Value Resolver — runs AFTER the generator, BEFORE the validator.
+Filter Value Resolver -- runs AFTER the generator, BEFORE the validator.
 
-Problem:
-    LLMs often invent filter values that don't match the actual data in the DB.
-    e.g. the question says "MDLZ SINGLES" but the DB stores "MONDELEZ SINGLES PPG".
-    This causes valid SQL to return zero rows silently.
+Problem
+-------
+LLMs often invent filter values that don't match actual data in the DB.
+More subtly, a query for "candy segment" may produce `category = 'candy'`
+when the correct answer is `mega_category = 'NON CHOCOLATE CANDY'`.
 
-Solution:
-    1. Parse the generated SQL with sqlglot and extract every  col = 'literal'
-       predicate from WHERE clauses (skip numeric literals).
-    2. For each (column, guessed_value) pair, fetch DISTINCT values from the DB.
-    3. Ask the LLM (in parallel threads) to pick the best match from the real
-       values.  The LLM responds with:
-           {"match": "<best DB value>", "confidence": 0.0–1.0, "clarify": false}
-       or, if it can't find anything sensible:
-           {"match": null, "confidence": <low>, "clarify": true,
-            "question": "Which <col> did you mean: A, B or C?"}
-    4. Auto-correct if confidence ≥ threshold (default 0.55).
-       Collect clarification questions for anything below the threshold.
-    5. Return corrected SQL.  If clarification is needed, set the state's
-       `direct_response` field — the graph routes to `direct_respond` and
-       asks the user before running SQL.
+Solution -- Intent-First, Hierarchy-Aware Resolution
+-----------------------------------------------------
+For product-hierarchy columns (mega_category, manufacturer, category,
+sub_category, brand, subbrand, ppg) the resolver runs 4 phases:
+
+  Phase 1 -- Granularity Intent Classification
+    Determine the intended hierarchy level from linguistic signals in the
+    user's question ("segment" -> mega_category; "brand" -> brand; etc.).
+    A fast keyword scan runs first; the LLM is called as a fallback.
+
+  Phase 2 -- Hierarchy-Aware Scoring
+    Fetch distinct DB values for EVERY hierarchy level. Score each
+    candidate as:
+        combined = 0.4 x string_similarity + 0.6 x level_alignment
+    Level-alignment weight dominates so we don't always fall to the lowest
+    textually-matching granularity.
+
+  Phase 3 -- Consistency & Contextual Override
+    If the top string match is at a finer level than the intended level,
+    but a coarser-level value exceeds the minimum string-similarity
+    threshold, prefer the coarser level (e.g. "candy segment" -> prefer
+    mega_category over category even if "candy" scores higher than
+    "non chocolate candy").
+
+  Phase 4 -- Ambiguity Fallback
+    When the top-2 candidates are within 0.10 of each other and are at
+    different levels, default to the coarser-level candidate and surface
+    the interpretation to the user ("Interpreted 'candy' as
+    mega_category='NON CHOCOLATE CANDY'. Let me know if you meant a more
+    specific level.").
+
+For non-hierarchy columns (market, customer, division, total, etc.) the
+original single-level LLM fuzzy matcher is used unchanged.
+
+SQL rewriting
+-------------
+The rewriter handles both value swaps (same column) and cross-column
+corrections (column rename + value swap) when the best match is found in
+a different hierarchy level than the one the SQL was written against.
 """
 
 from __future__ import annotations
 
+import difflib
 import json
+import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import sqlglot
@@ -35,25 +64,98 @@ import sqlglot.expressions as exp
 from core.llm_factory import create_llm
 from loguru import logger
 
+from config import settings
 from core.database import db_manager
 from core.state import AgentState
 
 # ── tunables ──────────────────────────────────────────────────────────────────
-# Auto-correct when LLM confidence is at or above this threshold; otherwise ask.
-_AUTO_CORRECT_THRESHOLD = 0.55
-
-# Maximum distinct values fed to the LLM per column (keeps prompt manageable).
-_MAX_DISTINCT = 300
-
-# System columns that are always numeric / IDs — never string-matched.
-_SKIP_COLUMNS = {
+_AUTO_CORRECT_THRESHOLD     = 0.55   # minimum combined score to auto-correct
+_HIERARCHY_AMBIGUITY_MARGIN = 0.10   # top-2 within this -> pick coarser level
+_MIN_STRING_SCORE_FOR_COARSER = 0.35 # Phase 3 override: coarser beats finer above this
+_MAX_DISTINCT               = 300    # max DB values per column
+_SKIP_COLUMNS: set = {
     "year_nielsen", "year", "period_num", "week_num", "month_num",
     "id", "row_id", "record_id",
+}
+
+# ── Three separate hierarchy groups (each is an independent coarsest→finest list) ──
+#
+# Category taxonomy: a product belongs to one mega_category > category > sub_category.
+_CATEGORY_HIERARCHY: List[str] = ["mega_category", "category", "sub_category"]
+#
+# Brand/product: a product has one manufacturer > brand > subbrand > ppg.
+_PRODUCT_HIERARCHY: List[str] = ["manufacturer", "brand", "subbrand", "ppg"]
+#
+# Geographic: data is sliced at one of four geographic granularities.
+#   total (national) is the coarsest; market (metro/SMM) is the finest.
+_GEO_HIERARCHY: List[str] = ["total", "division", "customer", "market"]
+
+# Quick set for "is this a hierarchy column at all?"
+_ALL_HIERARCHY_COLUMNS: set = set(
+    _CATEGORY_HIERARCHY + _PRODUCT_HIERARCHY + _GEO_HIERARCHY
+)
+
+# Map each column to the hierarchy list it belongs to.
+# The resolver uses this to restrict candidate comparison to the *correct* axis
+# (e.g. resolving 'brand' never looks at mega_category values).
+_COLUMN_TO_HIERARCHY: Dict[str, List[str]] = (
+    {col: _CATEGORY_HIERARCHY for col in _CATEGORY_HIERARCHY}
+    | {col: _PRODUCT_HIERARCHY for col in _PRODUCT_HIERARCHY}
+    | {col: _GEO_HIERARCHY     for col in _GEO_HIERARCHY}
+)
+
+# ── Linguistic signals for granularity intent (per hierarchy level) ────────────
+_INTENT_LEVEL_KEYWORDS: Dict[str, List[str]] = {
+    # --- Category taxonomy ---
+    "mega_category": [
+        "segment", "space", "universe", "macro", "aisle",
+        "sector", "super category", "mega", "master category",
+    ],
+    "category": [
+        "category", "type", "kind",
+    ],
+    "sub_category": [
+        "sub category", "subcategory", "sub segment",
+        "subsegment", "sub-category",
+    ],
+    # --- Brand/product hierarchy ---
+    "manufacturer": [
+        "manufacturer", "company", "player", "competitor",
+        "maker", "corp", "mfr", "who makes",
+    ],
+    "brand": [
+        "brand", "label", "banner",
+    ],
+    "subbrand": [
+        "variant", "subbrand", "sub brand", "sub-brand",
+    ],
+    "ppg": [
+        "sku", "ppg", "product group", "planning group", "upc",
+    ],
+    # --- Geographic hierarchy ---
+    "total": [
+        "total us", "national", "all us", "us total", "total market", "country",
+    ],
+    "division": [
+        "division", "region", "census region", "geographic division",
+    ],
+    "customer": [
+        "retailer", "store", "account", "customer", "chain", "outlet", "channel",
+    ],
+    "market": [
+        "market", "metro", "city", "dma", "smm", "local market", "metro area",
+    ],
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SQL parsing helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Use the dialect that matches the active provider so sqlglot can correctly
+# handle provider-specific syntax (e.g. backtick-quoted multi-part identifiers
+# with hyphens in Databricks vs. SQLite's simpler identifier rules).
+_SQLGLOT_DIALECT: str = "databricks" if settings.llm_provider.lower() == "dbrx" else "sqlite"
+
 
 def _extract_string_filters(sql: str) -> List[Tuple[str, str]]:
     """
@@ -63,7 +165,15 @@ def _extract_string_filters(sql: str) -> List[Tuple[str, str]]:
     """
     results: List[Tuple[str, str]] = []
     try:
-        tree = sqlglot.parse_one(sql, read="sqlite")
+        # Use IGNORE so sqlglot returns a partial AST rather than raising on
+        # Databricks-specific syntax it doesn't fully understand (backtick-quoted
+        # multi-part identifiers with hyphens, SparkSQL extensions, etc.).
+        # We only need the WHERE-clause predicate nodes, which always parse fine.
+        tree = sqlglot.parse_one(
+            sql,
+            read=_SQLGLOT_DIALECT,
+            error_level=sqlglot.errors.ErrorLevel.IGNORE,
+        )
     except Exception as exc:
         logger.warning(f"FilterResolver: could not parse SQL — {exc}")
         return results
@@ -104,26 +214,46 @@ def _extract_string_filters(sql: str) -> List[Tuple[str, str]]:
     return unique
 
 
-def _rewrite_sql(sql: str, corrections: Dict[Tuple[str, str], str]) -> str:
+def _rewrite_sql(
+    sql: str,
+    value_corrections: Dict[Tuple[str, str], str],
+    column_corrections: Optional[Dict[Tuple[str, str], Tuple[str, str]]] = None,
+) -> str:
     """
-    Replace filter literals in the SQL string.
-    ``corrections`` maps (column, old_value) → new_value.
-    We do a careful string replacement that respects SQL quoting.
-    """
-    if not corrections:
-        return sql
+    Apply corrections to the SQL string.
 
+    value_corrections:  (col, old_val) -> new_val
+        Same column, different value.
+    column_corrections: (col, old_val) -> (new_col, new_val)
+        Different hierarchy level was chosen — rename the column too.
+    """
     result = sql
-    for (col, old_val), new_val in corrections.items():
+
+    # 1. Cross-column corrections first (so value replacement doesn't interfere)
+    if column_corrections:
+        for (old_col, old_val), (new_col, new_val) in column_corrections.items():
+            if old_col == new_col:
+                continue  # handled below as a value correction
+            # col = 'old_val'  ->  new_col = 'new_val'
+            pattern = re.compile(
+                r"(?i)\b" + re.escape(old_col)
+                + r"(\s*=\s*')" + re.escape(old_val) + r"(')",
+            )
+            result = pattern.sub(lambda m, nc=new_col, nv=new_val: f"{nc}{m.group(1)}{nv}{m.group(2)}", result)
+            # Rename the column in any IN clause heading
+            in_pattern = re.compile(r"(?i)\b" + re.escape(old_col) + r"(\s+IN\s*\()")
+            result = in_pattern.sub(lambda m, nc=new_col: f"{nc}{m.group(1)}", result)
+            # Swap any remaining literal occurrences inside IN list
+            result = result.replace(f"'{old_val}'", f"'{new_val}'")
+
+    # 2. Same-column value corrections
+    for (col, old_val), new_val in value_corrections.items():
         if old_val == new_val:
             continue
-        # Replace  col = 'old'  →  col = 'new'  (case-insensitive column match)
         pattern = re.compile(
             r"(?i)(\b" + re.escape(col) + r"\s*=\s*')(" + re.escape(old_val) + r")(')",
         )
-        result = pattern.sub(lambda m: m.group(1) + new_val + m.group(3), result)
-
-        # Also handle IN lists:  'old_val'  →  'new_val'
+        result = pattern.sub(lambda m, nv=new_val: m.group(1) + nv + m.group(3), result)
         result = result.replace(f"'{old_val}'", f"'{new_val}'")
 
     return result
@@ -225,24 +355,559 @@ def _suggest_column(col_name: str) -> Optional[str]:
 # DB helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fetch_distinct(column: str, table: str = "nielsen_pos") -> List[str]:
+# Provider-aware default table for distinct-value fetches.
+_FETCH_TABLE: str = (
+    settings.dbx_full_table
+    if settings.llm_provider.lower() == "dbrx"
+    else "nielsen_pos"
+)
+
+
+def _get_col_value(row: dict, column: str):
+    """Return the value for *column* from *row* using a case-insensitive key lookup.
+
+    Databricks may return column names in a different case from the one we used
+    in the SELECT clause (e.g. 'BRAND' instead of 'brand').  This helper finds
+    the matching key regardless of casing so we never silently miss values.
+    """
+    if column in row:
+        return row[column]
+    lower = column.lower()
+    for k, v in row.items():
+        if k.lower() == lower:
+            return v
+    return None
+
+
+def _fetch_distinct(column: str, table: str = _FETCH_TABLE) -> List[str]:
     """Fetch up to _MAX_DISTINCT unique non-null values for a column."""
-    sql = (
-        f"SELECT DISTINCT {column} FROM {table} "
-        f"WHERE {column} IS NOT NULL AND {column} != '' "
-        f"LIMIT {_MAX_DISTINCT}"
-    )
+    # For Databricks/SparkSQL we skip the empty-string filter because the
+    # column may be a non-varchar type; IS NOT NULL is sufficient.
+    if settings.llm_provider.lower() == "dbrx":
+        sql = (
+            f"SELECT DISTINCT {column} FROM {table} "
+            f"WHERE {column} IS NOT NULL "
+            f"LIMIT {_MAX_DISTINCT}"
+        )
+    else:
+        sql = (
+            f"SELECT DISTINCT {column} FROM {table} "
+            f"WHERE {column} IS NOT NULL AND {column} != '' "
+            f"LIMIT {_MAX_DISTINCT}"
+        )
     rows, err, _ = db_manager.execute_query(sql)
-    if err or not rows:
+    if err:
+        logger.error(
+            f"FilterResolver: _fetch_distinct DB error for column '{column}': {err}"
+        )
         return []
-    return [str(r[column]) for r in rows if r.get(column)]
+    if not rows:
+        logger.warning(f"FilterResolver: _fetch_distinct returned 0 rows for '{column}'")
+        return []
+    values = [str(_get_col_value(r, column)) for r in rows
+              if _get_col_value(r, column) is not None]
+    logger.debug(f"FilterResolver: '{column}' → {len(values)} distinct values fetched")
+    return values
+
+
+def _fetch_all_hierarchy_values() -> Dict[str, List[str]]:
+    """DEPRECATED — retained for backward compat; use _build_value_cache() instead."""
+    return _build_value_cache()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM resolver
+# JSON value cache — avoids repeated DB hits across requests
 # ─────────────────────────────────────────────────────────────────────────────
 
-_RESOLVER_SYSTEM = """\
+
+def _discover_valid_cache_columns() -> List[str]:
+    """Return the subset of _ALL_HIERARCHY_COLUMNS that actually exist in the DB table.
+
+    For the ``dbrx`` provider we run ``SELECT * … LIMIT 0`` against the
+    Databricks table to discover the real column names and intersect them with
+    the hardcoded hierarchy set.  This prevents ``UNRESOLVED_COLUMN`` SQL
+    errors during cache warmup when the Databricks table has a different schema
+    than the SQLite ``nielsen_pos`` table used by the ``groq`` provider.
+
+    For ``groq`` (or any other provider) we trust the hardcoded list as-is.
+    """
+    if settings.llm_provider.lower() != "dbrx":
+        return list(_ALL_HIERARCHY_COLUMNS)
+    try:
+        from dbx_connection import get_table_columns  # lazy import — dbrx only
+        actual_cols = set(get_table_columns())
+        valid = [c for c in _ALL_HIERARCHY_COLUMNS if c in actual_cols]
+        if not valid:
+            logger.warning(
+                "FilterResolver: none of the expected hierarchy columns "
+                f"({sorted(_ALL_HIERARCHY_COLUMNS)}) exist in the Databricks "
+                f"table.  Actual columns found: {sorted(actual_cols)}.  "
+                "The value cache will be empty — update the hierarchy column "
+                "constants to match the real schema."
+            )
+        else:
+            logger.info(
+                f"FilterResolver: {len(valid)}/{len(_ALL_HIERARCHY_COLUMNS)} "
+                f"hierarchy columns present in Databricks table: {valid}"
+            )
+        return valid
+    except Exception as exc:
+        logger.warning(
+            f"FilterResolver: could not query Databricks table columns "
+            f"({exc}); falling back to full hardcoded list.  Cache warmup "
+            "may produce UNRESOLVED_COLUMN errors for non-existent columns."
+        )
+        return list(_ALL_HIERARCHY_COLUMNS)
+
+
+# All columns whose distinct values we cache.
+# For dbrx this is narrowed at startup to only columns that actually exist in
+# the Databricks table (avoiding UNRESOLVED_COLUMN errors during warmup).
+_CACHED_COLUMNS: List[str] = _discover_valid_cache_columns()
+
+# Cache file is scoped to the active provider so groq and dbrx never share
+# or overwrite each other's distinct-value snapshots.
+_CACHE_PATH: str = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "cache", f"db_values_cache_{settings.llm_provider.lower()}.json"
+)
+
+# In-memory cache — populated once per process lifetime by the background
+# warmup thread.  _get_all_cached_values() waits on _CACHE_READY_EVENT so
+# queries never see a partially-built cache.
+_VALUE_CACHE_MEMORY: Optional[Dict[str, List[str]]] = None
+_CACHE_READY_EVENT  = threading.Event()    # set when cache is ready
+_CACHE_WARM_THREAD: Optional[threading.Thread] = None  # background builder
+
+
+def _load_value_cache() -> Optional[Dict[str, List[str]]]:
+    """Load the JSON cache from disk.  Returns the values dict or None on miss."""
+    try:
+        if not os.path.exists(_CACHE_PATH):
+            return None
+        with open(_CACHE_PATH, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        return payload.get("values")
+    except Exception as exc:
+        logger.warning(f"FilterResolver: could not load value cache: {exc}")
+        return None
+
+
+def _save_value_cache(values: Dict[str, List[str]]) -> None:
+    """Persist distinct values to cache/db_values_cache_{provider}.json."""
+    try:
+        os.makedirs(os.path.dirname(_CACHE_PATH), exist_ok=True)
+        payload = {"cached_at": datetime.utcnow().isoformat(), "values": values}
+        with open(_CACHE_PATH, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        logger.info(f"FilterResolver: value cache saved to {_CACHE_PATH}")
+    except Exception as exc:
+        logger.warning(f"FilterResolver: could not save value cache: {exc}")
+
+
+def _build_value_cache() -> Dict[str, List[str]]:
+    """Fetch distinct values for every cached column in parallel and persist."""
+    result: Dict[str, List[str]] = {}
+    with ThreadPoolExecutor(max_workers=min(len(_CACHED_COLUMNS), 8)) as pool:
+        futures = {pool.submit(_fetch_distinct, col): col for col in _CACHED_COLUMNS}
+        for future in as_completed(futures):
+            col = futures[future]
+            try:
+                vals = future.result()
+                result[col] = vals
+                logger.info(
+                    f"FilterResolver: cached {len(vals)} distinct values for '{col}'"
+                )
+            except Exception as exc:
+                logger.error(
+                    f"FilterResolver: failed to fetch distinct for '{col}': {exc}"
+                )
+                result[col] = []
+
+    total_values = sum(len(v) for v in result.values())
+    if total_values > 0:
+        _save_value_cache(result)
+    else:
+        logger.error(
+            "FilterResolver: ALL columns returned 0 values — cache NOT written. "
+            "Check that column names in _CACHED_COLUMNS match the Databricks table "
+            f"'{_FETCH_TABLE}' and that the DB connection is working."
+        )
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Background warmup
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _warmup_worker() -> None:
+    """Runs in a daemon thread: load from disk or fetch from DB, then signal ready."""
+    global _VALUE_CACHE_MEMORY
+    try:
+        disk = _load_value_cache()
+        disk_has_data = disk is not None and sum(len(v) for v in disk.values()) > 0
+        if disk_has_data:
+            logger.info("FilterResolver: value cache loaded from disk.")
+            _VALUE_CACHE_MEMORY = disk
+        else:
+            if disk is not None:
+                logger.warning(
+                    "FilterResolver: disk cache exists but contains no values "
+                    "(previous build may have failed) — rebuilding from DB."
+                )
+            else:
+                logger.info(
+                    "FilterResolver: cache file absent — fetching distinct values from DB "
+                    "(one-time cost; subsequent runs load instantly from disk)."
+                )
+            _VALUE_CACHE_MEMORY = _build_value_cache()
+    except Exception as exc:
+        logger.error(f"FilterResolver: cache warmup failed: {exc}")
+        _VALUE_CACHE_MEMORY = {}
+    finally:
+        _CACHE_READY_EVENT.set()
+        logger.info("FilterResolver: value cache ready.")
+
+
+def initialize_value_cache() -> None:
+    """
+    Start the background cache warmup (idempotent — safe to call multiple times).
+
+    Call this once at **application startup** (before any query is served) so the
+    DB fetch overlaps with the rest of the startup sequence.  By the time the
+    first real query arrives the cache will already be warm.
+
+    If the JSON cache file exists the warmup is essentially instant (one file
+    read). The file is created automatically on the very first run.
+    """
+    global _CACHE_WARM_THREAD
+    if _CACHE_READY_EVENT.is_set():
+        return  # already warm
+    if _CACHE_WARM_THREAD is not None and _CACHE_WARM_THREAD.is_alive():
+        return  # already running
+    _CACHE_WARM_THREAD = threading.Thread(
+        target=_warmup_worker,
+        name="FilterResolver-CacheWarmup",
+        daemon=True,
+    )
+    _CACHE_WARM_THREAD.start()
+    logger.info("FilterResolver: cache warmup thread started.")
+
+
+def _get_all_cached_values() -> Dict[str, List[str]]:
+    """
+    Return distinct DB values for all hierarchy columns.
+
+    Blocks only if the background warmup thread has not finished yet
+    (which only happens when a query arrives faster than the DB fetch
+    completes — extremely unlikely in any real startup sequence).
+    """
+    if not _CACHE_READY_EVENT.is_set():
+        logger.debug("FilterResolver: waiting for cache warmup thread...")
+        _CACHE_READY_EVENT.wait()  # unblocks the moment the thread sets the event
+    return _VALUE_CACHE_MEMORY or {}
+
+
+def refresh_value_cache() -> Dict[str, List[str]]:
+    """Force-rebuild the value cache from the DB and reset the in-memory copy."""
+    global _VALUE_CACHE_MEMORY
+    _CACHE_READY_EVENT.clear()
+    logger.info("FilterResolver: refreshing value cache from DB.")
+    _VALUE_CACHE_MEMORY = _build_value_cache()
+    _CACHE_READY_EVENT.set()
+    return _VALUE_CACHE_MEMORY
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hierarchy-aware scoring helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fuzzy_score(a: str, b: str) -> float:
+    """Token-aware fuzzy similarity between two strings, 0-1."""
+    a, b = a.lower().strip(), b.lower().strip()
+    if a == b:
+        return 1.0
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    if a in b or b in a:
+        ratio = max(ratio, 0.75)
+    return ratio
+
+
+def _level_alignment_score(candidate_level: str, intended_level: str, hierarchy: List[str]) -> float:
+    """
+    Score how well the candidate's hierarchy level matches the intended level.
+    Same level -> 1.0; decreases with distance; coarser levels get a small
+    bonus over finer levels to implement the "default up" principle.
+
+    ``hierarchy`` must be the specific hierarchy list (category / product / geo)
+    that the column being resolved belongs to — never the full merged union.
+    """
+    try:
+        cand_idx     = hierarchy.index(candidate_level)
+        intended_idx = hierarchy.index(intended_level)
+    except ValueError:
+        return 0.5  # unknown level — neutral
+    distance = abs(cand_idx - intended_idx)
+    base_score    = max(0.0, 1.0 - distance * 0.25)
+    coarser_bonus = 0.05 if cand_idx < intended_idx else 0.0
+    return min(1.0, base_score + coarser_bonus)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 1 — Granularity intent classification
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CLASSIFY_SYSTEM = """\
+You are a Nielsen retail analytics expert. Given a user question and an entity
+mention from that question, identify the intended hierarchy level for that entity.
+
+The Nielsen hierarchies (each is independent — coarsest -> finest):
+
+  CATEGORY  : mega_category  > category       > sub_category
+  PRODUCT   : manufacturer   > brand          > subbrand       > ppg
+  GEOGRAPHIC: total          > division       > customer       > market
+
+Linguistic signals:
+  mega_category  — "segment", "space", "universe", "macro", "aisle", "sector"
+  category       — "category", "type", "kind"
+  sub_category   — "sub category", "subcategory", "sub segment"
+  manufacturer   — "manufacturer", "company", "player", "competitor", "maker"
+  brand          — "brand", "label", "banner"
+  subbrand       — "variant", "subbrand", "sub brand"
+  ppg            — "sku", "ppg", "product group", "planning group"
+  total          — "total us", "national", "all us", "country"
+  division       — "division", "region", "census region"
+  customer       — "retailer", "store", "account", "chain", "outlet", "channel"
+  market         — "market", "metro", "city", "dma", "smm", "local market"
+
+Return ONLY a JSON object — no prose, no markdown:
+{
+  "intended_level": "<one of the 11 levels above>",
+  "confidence": <0.0-1.0>,
+  "reasoning": "<one sentence>"
+}
+"""
+
+_CLASSIFY_USER = """\
+User question : {question}
+Entity mention: {mention}
+SQL column used by the model: {sql_column}
+Valid levels for this hierarchy: {valid_levels}
+
+Restrict your answer to one of the valid levels listed above.
+Return the JSON object now.
+"""
+
+
+def _fast_keyword_classify(
+    question: str, mention: str, valid_levels: List[str]
+) -> Optional[str]:
+    """
+    Fast keyword scan — no LLM.
+    Returns the intended hierarchy level (restricted to valid_levels) or None.
+    """
+    combined = (question + " " + mention).lower()
+    scores: Dict[str, int] = {level: 0 for level in valid_levels}
+    for level in valid_levels:
+        keywords = _INTENT_LEVEL_KEYWORDS.get(level, [])
+        for kw in keywords:
+            weight = 2 if " " in kw else 1
+            if kw in combined:
+                scores[level] += weight
+    best_level = max(scores, key=lambda l: scores[l])
+    if scores[best_level] > 0:
+        logger.debug(f"FilterResolver: fast keyword classify -> {best_level} (scores={scores})")
+        return best_level
+    return None
+
+
+def _classify_intent_level(
+    llm,
+    question: str,
+    mention: str,
+    sql_column: str,
+    valid_levels: List[str],
+) -> Tuple[str, float]:
+    """
+    Return (intended_level, confidence) restricted to the given hierarchy's levels.
+    Tries fast keyword scan first; falls back to LLM if no strong signal.
+    """
+    fast = _fast_keyword_classify(question, mention, valid_levels)
+    if fast:
+        return fast, 0.80
+    try:
+        resp = llm.invoke([
+            {"role": "system", "content": _CLASSIFY_SYSTEM},
+            {"role": "user",   "content": _CLASSIFY_USER.format(
+                question=question, mention=mention,
+                sql_column=sql_column,
+                valid_levels=", ".join(valid_levels),
+            )},
+        ])
+        raw = resp.content.strip()
+        raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
+        raw = raw.replace("```", "").strip()
+        data = json.loads(raw)
+        level = data.get("intended_level", sql_column)
+        if level not in valid_levels:
+            level = sql_column if sql_column in valid_levels else valid_levels[0]
+        conf  = float(data.get("confidence", 0.5))
+        logger.debug(
+            f"FilterResolver: LLM classify '{mention}' -> {level} "
+            f"(conf={conf:.2f}) — {data.get('reasoning', '')}"
+        )
+        return level, conf
+    except Exception as exc:
+        logger.warning(f"FilterResolver: intent classification failed — {exc}")
+        return sql_column if sql_column in valid_levels else valid_levels[0], 0.5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2-4 — Hierarchy-aware candidate resolution
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_hierarchy_entity(
+    llm,
+    question: str,
+    sql_column: str,
+    guessed: str,
+    all_hierarchy_values: Dict[str, List[str]],
+    hierarchy: List[str],
+) -> dict:
+    """
+    4-phase intent-first, hierarchy-aware resolution for all three hierarchy types
+    (category, product, geographic).
+
+    ``hierarchy`` is the specific ordered list for this axis
+    (e.g. _PRODUCT_HIERARCHY); all scoring is restricted to that list so that
+    brand values are never conflated with mega_category or market values.
+
+    Returns dict with keys: match, matched_column, confidence, clarify,
+    question (clarification text), interpretation (user-facing note).
+    """
+    # Phase 1: classify intended granularity — restricted to this hierarchy's levels
+    intended_level, intent_conf = _classify_intent_level(
+        llm, question, guessed, sql_column, valid_levels=hierarchy
+    )
+    logger.debug(
+        f"FilterResolver: '{guessed}' in '{sql_column}' -> "
+        f"intended level = {intended_level} (conf={intent_conf:.2f})"
+    )
+
+    # Phase 2: score every DB value across all levels of *this* hierarchy
+    candidates = []
+    for level, values in all_hierarchy_values.items():
+        for val in values:
+            s_score  = _fuzzy_score(guessed, val)
+            l_score  = _level_alignment_score(level, intended_level, hierarchy)
+            combined = 0.4 * s_score + 0.6 * l_score
+            candidates.append({
+                "value": val, "level": level,
+                "s_score": s_score, "l_score": l_score, "combined": combined,
+            })
+
+    if not candidates:
+        return {
+            "match": guessed, "matched_column": sql_column,
+            "confidence": 0.0, "clarify": True,
+            "question": "I couldn't find any matching values in the database.",
+            "interpretation": None,
+        }
+
+    candidates.sort(key=lambda x: x["combined"], reverse=True)
+    top = candidates[0]
+
+    # Phase 3: hierarchy consistency — prefer coarser if top is finer than intended
+    top_idx      = hierarchy.index(top["level"]) if top["level"] in hierarchy else 0
+    intended_idx = hierarchy.index(intended_level) if intended_level in hierarchy else 0
+
+    if top_idx > intended_idx:
+        for cand in candidates:
+            cand_idx = hierarchy.index(cand["level"]) if cand["level"] in hierarchy else len(hierarchy)
+            if cand_idx <= intended_idx and cand["s_score"] >= _MIN_STRING_SCORE_FOR_COARSER:
+                logger.info(
+                    f"FilterResolver: Phase 3 override — promoted "
+                    f"'{cand['value']}' ({cand['level']}) over "
+                    f"'{top['value']}' ({top['level']}) "
+                    f"because intended level={intended_level}"
+                )
+                top = cand
+                break
+
+    # Phase 4: ambiguity — default to coarser when top-2 are close
+    second = candidates[1] if len(candidates) > 1 else None
+    ambiguous = (
+        second is not None
+        and top["combined"] - second["combined"] <= _HIERARCHY_AMBIGUITY_MARGIN
+        and top["level"] != second["level"]
+    )
+
+    if ambiguous:
+        top_idx2    = hierarchy.index(top["level"])    if top["level"]    in hierarchy else 0
+        second_idx2 = hierarchy.index(second["level"]) if second["level"] in hierarchy else 0
+        coarser = top if top_idx2 <= second_idx2 else second
+        finer   = second if top_idx2 <= second_idx2 else top
+        logger.info(
+            f"FilterResolver: ambiguous — '{top['value']}' ({top['level']}) vs "
+            f"'{second['value']}' ({second['level']}) — defaulting to coarser: "
+            f"'{coarser['value']}' ({coarser['level']})"
+        )
+        interpretation = (
+            f"Interpreted **'{guessed}'** as **{coarser['level']}** = "
+            f"'**{coarser['value']}**'. "
+            f"(Also matched '{finer['value']}' at {finer['level']} level — "
+            f"defaulted to broader level for analytics.)"
+        )
+        return {
+            "match":          coarser["value"],
+            "matched_column": coarser["level"],
+            "confidence":     coarser["combined"],
+            "clarify":        False,
+            "question":       None,
+            "interpretation": interpretation,
+        }
+
+    # Normal resolution
+    confidence     = top["combined"]
+    level_note     = f" (intended level: {intended_level})" if top["level"] != intended_level else ""
+    interpretation = (
+        f"Interpreted **'{guessed}'** as **{top['level']}** = '**{top['value']}**'{level_note}"
+    )
+
+    if confidence < _AUTO_CORRECT_THRESHOLD:
+        top_at_level = [c for c in candidates[:5] if c["level"] == intended_level] or candidates[:3]
+        options_str  = ", ".join(f"'{c['value']}' ({c['level']})" for c in top_at_level)
+        return {
+            "match":          top["value"],
+            "matched_column": top["level"],
+            "confidence":     confidence,
+            "clarify":        True,
+            "question": (
+                f"Could you clarify what **'{guessed}'** refers to? "
+                f"Possible matches: {options_str}."
+            ),
+            "interpretation": interpretation,
+        }
+
+    logger.info(
+        f"FilterResolver: hierarchy resolved '{guessed}' -> "
+        f"{top['level']}='{top['value']}' (score={confidence:.2f})"
+    )
+    return {
+        "match":          top["value"],
+        "matched_column": top["level"],
+        "confidence":     confidence,
+        "clarify":        False,
+        "question":       None,
+        "interpretation": interpretation,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Simple LLM resolver (non-hierarchy columns)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SIMPLE_SYSTEM = """\
 You are a database filter-value matcher for a Nielsen retail analytics system.
 
 Given:
@@ -253,24 +918,24 @@ Given:
 Your task: identify which real database value best matches the guessed value.
 
 Rules:
-- Prioritise semantic / abbreviation matches (e.g. "MDLZ" → "MONDELEZ",
-  "Northeast" → "NE", "Total Bars" → "TOTAL CHOCOLATE BARS", etc.).
+- Prioritise semantic / abbreviation matches (e.g. "MDLZ" -> "MONDELEZ",
+  "Northeast" -> "NE", "Total Bars" -> "TOTAL CHOCOLATE BARS", etc.).
 - Consider common Nielsen abbreviations and category naming conventions.
-- If two or more values are equally plausible AND the distinction is business-critical,
+- If two or more values are equally plausible AND the distinction matters,
   set "clarify": true and compose a short clarifying question.
-- If there is simply no reasonable match (nothing close), set "clarify": true.
+- If there is simply no reasonable match, set "clarify": true.
 - Return ONLY a JSON object — no prose, no markdown.
 
 JSON schema:
 {
   "match": "<best matching DB value or null>",
-  "confidence": <0.0 – 1.0>,
+  "confidence": <0.0 - 1.0>,
   "clarify": <true | false>,
   "question": "<clarification question if clarify=true, else null>"
 }
 """
 
-_RESOLVER_USER = """\
+_SIMPLE_USER = """\
 Column     : {column}
 SQL value  : {guessed}
 DB values  : {db_values}
@@ -279,36 +944,37 @@ Return the JSON object now.
 """
 
 
-def _resolve_one(
+def _resolve_simple(
     llm,
     column: str,
     guessed: str,
     db_values: List[str],
 ) -> dict:
-    """Ask the LLM to resolve a single filter value.  Returns parsed JSON dict."""
+    """
+    Simple LLM-based resolver for non-hierarchy columns (market, customer,
+    division, total, etc.).  Returns the same dict shape as
+    _resolve_hierarchy_entity with matched_column = column (unchanged).
+    """
+    base = {"matched_column": column, "interpretation": None}
+
     if not db_values:
-        # Column doesn't exist — try to suggest the closest real column.
         suggested = _suggest_column(column)
         if suggested:
             suggested_values = _fetch_distinct(suggested)
             if suggested_values:
-                # Try exact match first
                 lower_map = {v.lower(): v for v in suggested_values}
                 if guessed.lower() in lower_map:
                     best = lower_map[guessed.lower()]
-                    return {
-                        "match": guessed, "confidence": 0.0, "clarify": True,
-                        "question": (
-                            f"There's no column named **{column}** in the database — "
-                            f"did you mean **{suggested}** = '{best}'?"
-                        ),
-                    }
-                # Ask LLM to find best match in the suggested column
+                    return {**base, "match": guessed, "confidence": 0.0, "clarify": True,
+                            "question": (
+                                f"There's no column named **{column}** in the database — "
+                                f"did you mean **{suggested}** = '{best}'?"
+                            )}
                 values_str = "\n".join(f"  - {v}" for v in suggested_values[:_MAX_DISTINCT])
                 try:
                     resp = llm.invoke([
-                        {"role": "system", "content": _RESOLVER_SYSTEM},
-                        {"role": "user",   "content": _RESOLVER_USER.format(
+                        {"role": "system", "content": _SIMPLE_SYSTEM},
+                        {"role": "user",   "content": _SIMPLE_USER.format(
                             column=suggested, guessed=guessed, db_values=values_str
                         )},
                     ])
@@ -316,60 +982,95 @@ def _resolve_one(
                     raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
                     raw = raw.replace("```", "").strip()
                     result = json.loads(raw)
-                    best  = result.get("match") or guessed
-                    conf  = float(result.get("confidence", 0.0))
-                    question = (
-                        f"There's no column named **{column}** in the database. "
-                        f"Did you mean **{suggested}** = '{best}'?"
-                        + (f" (confidence: {conf:.0%})" if conf < 0.9 else "")
-                    )
-                    return {
-                        "match": guessed, "confidence": 0.0, "clarify": True,
-                        "question": question,
-                    }
+                    best = result.get("match") or guessed
+                    conf = float(result.get("confidence", 0.0))
+                    return {**base, "match": guessed, "confidence": 0.0, "clarify": True,
+                            "question": (
+                                f"There's no column named **{column}** in the database. "
+                                f"Did you mean **{suggested}** = '{best}'?"
+                                + (f" (confidence: {conf:.0%})" if conf < 0.9 else "")
+                            )}
                 except Exception as exc:
                     logger.warning(f"FilterResolver: suggestion LLM failed — {exc}")
-                    return {
-                        "match": guessed, "confidence": 0.0, "clarify": True,
-                        "question": (
-                            f"There's no column named **{column}** in the database — "
-                            f"did you mean **{suggested}**?"
-                        ),
-                    }
-        # No suggestion found — list available columns
+                    return {**base, "match": guessed, "confidence": 0.0, "clarify": True,
+                            "question": (
+                                f"There's no column named **{column}** — "
+                                f"did you mean **{suggested}**?"
+                            )}
         cols = ", ".join(sorted(_KNOWN_DB_COLUMNS))
-        return {
-            "match": guessed, "confidence": 0.0, "clarify": True,
-            "question": (
-                f"I couldn't find a column named **{column}** in the database. "
-                f"Available filter columns are: {cols}."
-            ),
-        }
+        return {**base, "match": guessed, "confidence": 0.0, "clarify": True,
+                "question": (
+                    f"I couldn't find a column named **{column}** in the database. "
+                    f"Available filter columns are: {cols}."
+                )}
 
-    # If guessed already in db_values (exact, case-insensitive) → skip LLM
+    # Exact case-insensitive match — skip LLM
     lower_map = {v.lower(): v for v in db_values}
     if guessed.lower() in lower_map:
         exact = lower_map[guessed.lower()]
-        logger.debug(f"FilterResolver: '{column}'='{guessed}' exact match → '{exact}'")
-        return {"match": exact, "confidence": 1.0, "clarify": False, "question": None}
+        logger.debug(f"FilterResolver: '{column}'='{guessed}' exact match -> '{exact}'")
+        return {**base, "match": exact, "confidence": 1.0, "clarify": False, "question": None}
 
     values_str = "\n".join(f"  - {v}" for v in db_values[:_MAX_DISTINCT])
     try:
         resp = llm.invoke([
-            {"role": "system", "content": _RESOLVER_SYSTEM},
-            {"role": "user",   "content": _RESOLVER_USER.format(
+            {"role": "system", "content": _SIMPLE_SYSTEM},
+            {"role": "user",   "content": _SIMPLE_USER.format(
                 column=column, guessed=guessed, db_values=values_str
             )},
         ])
         raw = resp.content.strip()
-        # Strip markdown fences if present
         raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
         raw = raw.replace("```", "").strip()
-        return json.loads(raw)
+        result = json.loads(raw)
+        return {**base, **result}
     except Exception as exc:
         logger.warning(f"FilterResolver: LLM call failed for {column}='{guessed}' — {exc}")
-        return {"match": guessed, "confidence": 0.0, "clarify": True,
+        return {**base, "match": guessed, "confidence": 0.0, "clarify": True,
                 "question": f"I couldn't verify the value '{guessed}' for '{column}'."}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dispatcher — routes to hierarchy or simple resolver
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_one(
+    llm,
+    question: str,
+    column: str,
+    guessed: str,
+    cached_values: Dict[str, List[str]],
+) -> dict:
+    """
+    Dispatch to the correct resolver based on the column type.
+
+    Hierarchy columns (category, product, or geographic hierarchy)
+        -> _resolve_hierarchy_entity
+        Uses 4-phase intent-first, level-aware scoring restricted to the
+        column's own hierarchy axis (no cross-contamination between axes).
+
+    All other columns -> _resolve_simple
+        Single-level LLM fuzzy matcher using cached or freshly-fetched values.
+
+    ``cached_values`` is the full dict returned by _get_all_cached_values().
+    """
+    # Normalise hallucinated column names first
+    real_column = _suggest_column(column) if column not in _KNOWN_DB_COLUMNS else column
+    if real_column and real_column != column:
+        logger.info(f"FilterResolver: column '{column}' mapped to '{real_column}'")
+
+    effective_column = real_column or column
+
+    if effective_column in _ALL_HIERARCHY_COLUMNS:
+        hierarchy = _COLUMN_TO_HIERARCHY[effective_column]
+        # Only pass values that belong to *this* hierarchy axis
+        hierarchy_values = {col: cached_values.get(col, []) for col in hierarchy}
+        return _resolve_hierarchy_entity(
+            llm, question, effective_column, guessed, hierarchy_values, hierarchy
+        )
+    else:
+        vals = cached_values.get(effective_column) or _fetch_distinct(effective_column)
+        return _resolve_simple(llm, effective_column, guessed, vals)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -378,14 +1079,25 @@ def _resolve_one(
 
 class FilterResolverAgent:
     """
-    Resolves SQL filter literals against actual DB values using parallel LLM calls.
+    Resolves SQL filter literals against actual DB values.
+
+    For product-hierarchy columns (mega_category, manufacturer, category,
+    sub_category, brand, subbrand, ppg) uses 4-phase intent-first resolution:
+      1. Classify intended granularity from the question's linguistic signals.
+      2. Score candidates across ALL hierarchy levels (level-alignment dominant).
+      3. Apply contextual override when top hit is finer than the intended level.
+      4. Default to coarser level when ambiguous — safer for analytics contexts.
+
+    For all other columns (market, customer, division, etc.) uses the original
+    single-level LLM fuzzy matcher.
     """
 
     def __init__(self):
         self.llm = create_llm("reasoning")
 
     def resolve(self, state: AgentState) -> dict:
-        sql = state.get("sql_query", "")
+        sql      = state.get("sql_query", "")
+        question = state.get("question", "")
         if not sql:
             return {}
 
@@ -396,25 +1108,33 @@ class FilterResolverAgent:
             logger.info("FilterResolver: no string filter literals found — skipping")
             return {}
 
-        logger.info(f"FilterResolver: {len(filters)} filter(s) to verify: "
-                    + ", ".join(f"{c}='{v}'" for c, v in filters))
+        logger.info(
+            f"FilterResolver: {len(filters)} filter(s) to verify: "
+            + ", ".join(f"{c}='{v}'" for c, v in filters)
+        )
 
-        # Fetch DB distinct values for unique columns (batch)
-        unique_cols = list({col for col, _ in filters})
-        db_map: Dict[str, List[str]] = {}
-        for col in unique_cols:
-            db_map[col] = _fetch_distinct(col)
-            logger.debug(f"FilterResolver: {col} → {len(db_map[col])} distinct values")
+        # Load all cached distinct values in ONE call — no DB hit when cache exists.
+        # If the cache file is absent this will fetch everything from the DB once
+        # and persist the result, so subsequent requests are always fast.
+        cached_values = _get_all_cached_values()
+        logger.debug("FilterResolver: value cache loaded")
 
         # Resolve all filters in parallel
-        corrections: Dict[Tuple[str, str], str] = {}
-        clarifications: List[str] = []
-        filter_log: List[Dict] = []
+        value_corrections:  Dict[Tuple[str, str], str]             = {}
+        column_corrections: Dict[Tuple[str, str], Tuple[str, str]] = {}
+        clarifications:  List[str] = []
+        interpretations: List[str] = []
+        filter_log:      List[Dict] = []
 
         with ThreadPoolExecutor(max_workers=min(len(filters), 6)) as pool:
             futures = {
                 pool.submit(
-                    _resolve_one, self.llm, col, val, db_map.get(col, [])
+                    _resolve_one,
+                    self.llm,
+                    question,
+                    col,
+                    val,
+                    cached_values,
                 ): (col, val)
                 for col, val in filters
             }
@@ -424,75 +1144,101 @@ class FilterResolverAgent:
                     result = future.result()
                 except Exception as exc:
                     logger.error(f"FilterResolver: resolution failed for {col}='{val}': {exc}")
-                    result = {"match": val, "confidence": 0.0, "clarify": False, "question": None}
+                    result = {
+                        "match": val, "matched_column": col,
+                        "confidence": 0.0, "clarify": False,
+                        "question": None, "interpretation": None,
+                    }
 
-                match      = result.get("match") or val
-                confidence = float(result.get("confidence", 0.0))
-                clarify    = result.get("clarify", False)
-                question   = result.get("question")
+                match          = result.get("match") or val
+                matched_column = result.get("matched_column") or col
+                confidence     = float(result.get("confidence", 0.0))
+                clarify        = result.get("clarify", False)
+                question_text  = result.get("question")
+                interpretation = result.get("interpretation")
 
                 log_entry = {
-                    "column": col, "sql_value": val,
-                    "db_match": match, "confidence": confidence,
+                    "column":         col,
+                    "sql_value":      val,
+                    "db_match":       match,
+                    "matched_column": matched_column,
+                    "confidence":     confidence,
                 }
+
+                if interpretation:
+                    interpretations.append(interpretation)
 
                 if clarify or confidence < _AUTO_CORRECT_THRESHOLD:
                     logger.warning(
                         f"FilterResolver: '{col}'='{val}' — "
                         f"low confidence ({confidence:.2f}), needs clarification"
                     )
-                    if question:
-                        clarifications.append(question)
+                    if question_text:
+                        clarifications.append(question_text)
                     log_entry["action"] = "clarify"
+
+                elif matched_column != col:
+                    # Cross-column correction: hierarchy level changed
+                    logger.info(
+                        f"FilterResolver: '{col}'='{val}' -> "
+                        f"'{matched_column}'='{match}' "
+                        f"(conf={confidence:.2f}) — cross-column correction"
+                    )
+                    column_corrections[(col, val)] = (matched_column, match)
+                    log_entry["action"] = "column_corrected"
+
+                elif match != val:
+                    logger.info(
+                        f"FilterResolver: '{col}' '{val}' -> '{match}' "
+                        f"(conf={confidence:.2f}) — value corrected"
+                    )
+                    value_corrections[(col, val)] = match
+                    log_entry["action"] = "corrected"
+
                 else:
-                    if match != val:
-                        logger.info(
-                            f"FilterResolver: '{col}' '{val}' → '{match}' "
-                            f"(confidence {confidence:.2f}) — auto-corrected"
-                        )
-                        corrections[(col, val)] = match
-                        log_entry["action"] = "corrected"
-                    else:
-                        log_entry["action"] = "unchanged"
+                    log_entry["action"] = "unchanged"
 
                 filter_log.append(log_entry)
 
         # Apply corrections to SQL
-        corrected_sql = _rewrite_sql(sql, corrections) if corrections else sql
+        corrected_sql = sql
+        if value_corrections or column_corrections:
+            corrected_sql = _rewrite_sql(sql, value_corrections, column_corrections)
 
-        # Log summary
-        n_corrected  = sum(1 for e in filter_log if e["action"] == "corrected")
-        n_unchanged  = sum(1 for e in filter_log if e["action"] == "unchanged")
-        n_clarify    = sum(1 for e in filter_log if e["action"] == "clarify")
+        # Summary log
+        n_val    = sum(1 for e in filter_log if e["action"] == "corrected")
+        n_col    = sum(1 for e in filter_log if e["action"] == "column_corrected")
+        n_same   = sum(1 for e in filter_log if e["action"] == "unchanged")
+        n_clarify = sum(1 for e in filter_log if e["action"] == "clarify")
         logger.info(
-            f"FilterResolver done: {n_corrected} corrected, "
-            f"{n_unchanged} unchanged, {n_clarify} need clarification"
+            f"FilterResolver done: {n_val} value-corrected, "
+            f"{n_col} column+value-corrected, "
+            f"{n_same} unchanged, {n_clarify} need clarification"
         )
 
         out: dict = {"filter_log": filter_log}
 
-        if corrections:
+        if value_corrections or column_corrections:
             out["sql_query"] = corrected_sql
 
+        if interpretations:
+            out["filter_interpretations"] = interpretations
+
         if clarifications:
-            # Build a single readable clarification message
-            intro = (
-                "Before I run the query, I need a quick clarification:\n\n"
-                + "\n".join(f"• {q}" for q in clarifications)
-            )
-            out["direct_response"] = intro
+            intro = "Before I run the query, I need a quick clarification:\n\n"
+            if interpretations:
+                intro = (
+                    "ℹ️ " + " | ".join(interpretations) + "\n\n" + intro
+                )
+            intro += "\n".join(f"• {q}" for q in clarifications)
+            out["direct_response"]     = intro
             out["needs_clarification"] = True
-            # Store context so interaction_node on the NEXT turn can auto-route
-            # to correction without re-classifying intent.
             out["pending_filter_clarification"] = [
                 {
                     "column":         e["column"],
+                    "matched_column": e.get("matched_column"),
                     "sql_value":      e["sql_value"],
                     "db_match":       e.get("db_match"),
-                    "clarification_q": clarifications[
-                        sum(1 for x in filter_log[:filter_log.index(e)]
-                            if x.get("action") == "clarify")
-                    ] if e.get("action") == "clarify" else None,
                 }
                 for e in filter_log if e.get("action") == "clarify"
             ]
@@ -505,3 +1251,11 @@ class FilterResolverAgent:
 def filter_resolver_node(state: AgentState) -> dict:
     """LangGraph node wrapper for FilterResolverAgent."""
     return FilterResolverAgent().resolve(state)
+
+
+# ── Eagerly start warmup at import time ───────────────────────────────────────
+# The daemon thread runs in the background while the rest of the application
+# initialises.  The JSON cache file is read (or built from the DB) once, then
+# served from memory for the lifetime of the process.
+initialize_value_cache()
+

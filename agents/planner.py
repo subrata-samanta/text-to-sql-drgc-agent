@@ -8,6 +8,14 @@ from langchain_core.prompts import ChatPromptTemplate
 from loguru import logger
 from core.state import AgentState
 from core.llm_factory import create_llm
+from config import settings
+
+# Provider-aware table reference for prompt context
+_TABLE_REF: str = (
+    settings.dbx_full_table
+    if settings.llm_provider.lower() == "dbrx"
+    else "nielsen_pos"
+)
 
 # ── Nielsen schema category metadata ─────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,7 +38,7 @@ class PlannerAgent:
         # System prompt for logical planning + category selection
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", """You are a data architect specializing in Nielsen POS SQL query planning.
-The database has a SINGLE table called `nielsen_pos`.
+The database has a SINGLE table called `{table_ref}`.
 
 Your task: Decompose the user's question into clear, numbered logical steps AND identify
 the minimal set of schema column categories needed to answer it.
@@ -154,6 +162,7 @@ Conversation history (for resolving follow-up questions):
                 "question": question,
                 "conversation_history": history_text,
                 "categories_block": _CATEGORIES_BLOCK,
+                "table_ref": _TABLE_REF,
             })
             raw = response.content
 

@@ -32,7 +32,16 @@ import sqlglot.errors
 from loguru import logger
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from config import settings
 from core.state import AgentState
+
+# Provider-aware SQL helpers
+_IS_DBRX: bool = settings.llm_provider.lower() == "dbrx"
+# Table name and CAST type differ between SQLite (groq) and SparkSQL (dbrx)
+_VAL_TABLE: str = (
+    settings.dbx_full_table if _IS_DBRX else "nielsen_pos"
+)
+_CAST_STR: str = "STRING" if _IS_DBRX else "TEXT"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -62,6 +71,29 @@ DIMENSION_COLUMNS: List[Tuple[str, str]] = [
 
 # All entity columns in resolution order (hierarchy first, then dimensions)
 ALL_ENTITY_COLUMNS: List[Tuple[str, str]] = HIERARCHY + DIMENSION_COLUMNS
+
+# ── For dbrx: discover which entity columns actually exist in the live table ──
+# This prevents UNRESOLVED_COLUMN SQL errors during entity resolution when the
+# Databricks table has a different schema than the SQLite nielsen_pos table.
+_DBRX_TABLE_COLS: set = set()
+if _IS_DBRX:
+    try:
+        from dbx_connection import get_table_columns as _get_dbx_cols
+        _DBRX_TABLE_COLS = set(_get_dbx_cols())
+        _missing_entity_cols = [c for c, _ in ALL_ENTITY_COLUMNS if c not in _DBRX_TABLE_COLS]
+        if _missing_entity_cols:
+            logger.warning(
+                f"Validator: {len(_missing_entity_cols)} entity column(s) are NOT "
+                f"present in the Databricks table and will be skipped during entity "
+                f"resolution: {_missing_entity_cols}"
+            )
+        else:
+            logger.info("Validator: all entity columns confirmed present in Databricks table.")
+    except Exception as _dbx_col_err:
+        logger.warning(
+            f"Validator: could not discover Databricks table columns ({_dbx_col_err}). "
+            "All entity columns will be attempted — UNRESOLVED_COLUMN errors may occur."
+        )
 
 # ── Metric keyword → SQL patterns that should be present ─────────────────────
 METRIC_PATTERNS: Dict[str, List[str]] = {
@@ -136,9 +168,17 @@ def _resolve_entity_column(entity_upper: str) -> Optional[Tuple[str, str]]:
         from core.database import db_manager
         safe = entity_upper.replace("'", "''")   # basic SQL injection guard
         for col, label in ALL_ENTITY_COLUMNS:
+            # For dbrx: skip columns that don't exist in the actual table.
+            # Querying a non-existent column triggers UNRESOLVED_COLUMN which
+            # wastes a round-trip and previously caused a spurious reconnect.
+            if _IS_DBRX and _DBRX_TABLE_COLS and col not in _DBRX_TABLE_COLS:
+                logger.debug(
+                    f"Entity resolution: skipping '{col}' — not in Databricks table."
+                )
+                continue
             sql = (
-                f"SELECT 1 FROM nielsen_pos "
-                f"WHERE UPPER(CAST({col} AS TEXT)) = '{safe}' "
+                f"SELECT 1 FROM {_VAL_TABLE} "
+                f"WHERE UPPER(CAST({col} AS {_CAST_STR})) = '{safe}' "
                 f"LIMIT 1"
             )
             result, error, _ = db_manager.execute_query(sql)
@@ -287,15 +327,21 @@ def _validate_syntax(sql: str) -> Tuple[bool, List[str]]:
     """
     Parse *sql* with sqlglot and return (passed, issues).
 
-    Tries the Databricks dialect first (matching our target execution engine),
-    then Spark SQL, then generic ANSI.  A query that cannot be parsed under any
-    dialect returns a concrete error message pinpointing the problematic token
-    and line/column position so the generator can fix it.
+    For the dbrx provider, sqlglot is NOT used — it cannot faithfully handle
+    Databricks SparkSQL with backtick-quoted, hyphenated three-part catalog
+    identifiers (e.g. `dev-amer-customer-catalog`.`schema`.`table`).  Any
+    real syntax errors will surface at execution time in the critic agent.
 
+    For the groq/SQLite provider, three dialects are tried in order.
     Returns (True, []) if parsing succeeds under at least one dialect.
     """
     if not sql or not sql.strip():
         return False, ["SQL is empty."]
+
+    # dbrx: trust the SQL and let Databricks execution surface real errors.
+    if settings.llm_provider.lower() == "dbrx":
+        logger.debug("SQL Validator: skipping sqlglot syntax check for dbrx provider.")
+        return True, []
 
     last_errors: List[str] = []
 
@@ -303,14 +349,12 @@ def _validate_syntax(sql: str) -> Tuple[bool, List[str]]:
         try:
             kwargs = {"dialect": dialect} if dialect else {}
             sqlglot.parse(sql, **kwargs, error_level=sqlglot.errors.ErrorLevel.RAISE)
-            # Parsed successfully — report the winning dialect for transparency
             dialect_label = dialect if dialect else "ANSI"
             logger.debug(f"SQL Validator: syntax OK (dialect={dialect_label!r})")
             return True, []
         except sqlglot.errors.ParseError as exc:
             msgs = []
             for err in exc.errors:
-                # Each error dict contains: description, line, col, start_context, ...
                 desc   = err.get("description", str(exc))
                 line   = err.get("line", "?")
                 col    = err.get("col", "?")
@@ -318,7 +362,7 @@ def _validate_syntax(sql: str) -> Tuple[bool, List[str]]:
                 token_hint = f" near '{token}'" if token else ""
                 msgs.append(f"{desc}{token_hint} (line {line}, col {col})")
             last_errors = msgs or [str(exc)]
-        except Exception as exc:          # safeguard – never block the pipeline
+        except Exception as exc:
             last_errors = [str(exc)]
 
     issues = [f"SQL syntax error: {e}" for e in last_errors]
@@ -431,8 +475,8 @@ def _build_llm():
     return create_llm("fast")
 
 
-_SYSTEM_PROMPT = """You are a SQL correctness auditor for a Nielsen POS analytics database.
-Single table: nielsen_pos.
+_SYSTEM_PROMPT = f"""You are a SQL correctness auditor for a Nielsen POS analytics database.
+Single table: {_VAL_TABLE}.
 
 Entity hierarchy (PRIORITY ORDER — always use the FIRST match for ambiguous entities):
   mega_category → manufacturer → category → sub_category → brand → subbrand → ppg

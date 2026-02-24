@@ -26,8 +26,50 @@ from nielsen_schema import (                                   # noqa: E402
 # Schema helpers (computed once at import time)
 # ─────────────────────────────────────────────────────────────────────────────
 
-TABLE_NAME: str = NIELSEN_SCHEMA["table"]    # "nielsen_pos"
+TABLE_NAME: str = NIELSEN_SCHEMA["table"]    # "nielsen_pos" (local SQLite)
 _COLUMNS: dict  = NIELSEN_SCHEMA["columns"]  # nested dict keyed by group
+
+# Provider-aware table reference — fully-qualified for Databricks, plain for SQLite.
+_TABLE_REF: str = (
+    settings.dbx_full_table
+    if settings.llm_provider.lower() == "dbrx"
+    else TABLE_NAME
+)
+
+# Provider-aware SQL dialect block injected into the schema context.
+_DIALECT_RULES: str = (
+    """\
+──────────────────────────────────────────────────────────────────────────
+Databricks SparkSQL DIALECT  –  standard SQL functions are supported
+──────────────────────────────────────────────────────────────────────────
+• YEAR(), MONTH(), QUARTER(), DATE_FORMAT(), CURRENT_DATE(), COALESCE() are valid.
+• year_month is a YYYYMM INTEGER (e.g. 202301):
+    year  →  year_nielsen  OR  CAST(year_month / 100 AS INT)
+    month →  year_month % 100
+• Pagination → LIMIT N
+• No trailing commas before FROM, WHERE, GROUP BY, ORDER BY, HAVING."""
+    if settings.llm_provider.lower() == "dbrx"
+    else """\
+──────────────────────────────────────────────────────────────────────────
+SQLite DIALECT RULES  –  THIS DATABASE IS SQLITE  (not MySQL / SQL Server)
+──────────────────────────────────────────────────────────────────────────
+• FORBIDDEN functions (will crash): YEAR(), MONTH(), QUARTER(), DATE_FORMAT(),
+  GETDATE(), NOW(), DATEADD(), DATEDIFF(), NVL(), ISNULL(), TOP N.
+• Time extraction from year_month (YYYYMM integer, e.g. 202301):
+    year  →  year_nielsen           (dedicated column — ALWAYS prefer this)
+    month →  year_month % 100
+    Do NOT wrap year_month in YEAR() — it is already an integer.
+• Time extraction from period_date (DATE string, e.g. '2023-01-28'):
+    year   →  CAST(strftime('%Y', period_date) AS INTEGER)
+    month  →  CAST(strftime('%m', period_date) AS INTEGER)
+    Use period_date only when year_month is insufficient for the question.
+• Quarterly analysis → use quarter_nielsen + year_nielsen columns directly;
+  NEVER compute QUARTER() from anything.
+• Pagination / row-limiting → LIMIT N   (not TOP N)
+• NULL coalescing         → COALESCE(a, b)   (not NVL / ISNULL)
+• Current date            → date('now')      (not GETDATE() / NOW())
+• No trailing commas before FROM, WHERE, GROUP BY, ORDER BY, HAVING."""
+)
 
 
 def _build_full_schema_text() -> str:
@@ -35,7 +77,7 @@ def _build_full_schema_text() -> str:
     Render the full Nielsen schema as a structured text block that can be
     dropped verbatim into an LLM prompt.
     """
-    lines = [f"TABLE: {TABLE_NAME}", "=" * 70]
+    lines = [f"TABLE: {_TABLE_REF}", "=" * 70]
     for group, cols in _COLUMNS.items():
         lines.append(f"\n── {group.upper().replace('_', ' ')} ──")
         for col_name, description in cols.items():
@@ -66,7 +108,7 @@ SQL GENERATION RULES  –  MANDATORY FOR EVERY QUERY
 1. ALWAYS write SQL using CTEs (WITH … AS (…)).  NEVER write flat queries.
 2. Give each CTE a descriptive snake_case name that reflects its purpose
    (e.g., entity_sales, total_market_sales, period1_sales, ytd_current).
-3. The ONLY table is:  {TABLE_NAME}
+3. The ONLY table is:  {_TABLE_REF}
 4. Every query MUST include exactly ONE geographic filter (priority order):
      a. customer  is mentioned → AND customer = '…'          (omit total / market)
      b. division  is mentioned → AND division = '…'          (omit total / market)
@@ -80,42 +122,21 @@ SQL GENERATION RULES  –  MANDATORY FOR EVERY QUERY
 10. Display must NEVER be aggregated with SUM – use weighted average only.
 
 ──────────────────────────────────────────────────────────────────────────
-SQLite DIALECT RULES  –  THIS DATABASE IS SQLITE  (not MySQL / SQL Server)
-──────────────────────────────────────────────────────────────────────────
-• FORBIDDEN functions (will crash): YEAR(), MONTH(), QUARTER(), DATE_FORMAT(),
-  GETDATE(), NOW(), DATEADD(), DATEDIFF(), NVL(), ISNULL(), TOP N.
-
-• Time extraction from year_month (YYYYMM integer, e.g. 202301):
-    year  →  year_nielsen           (dedicated column — ALWAYS prefer this)
-    month →  year_month % 100
-    Do NOT wrap year_month in YEAR() — it is already an integer.
-
-• Time extraction from period_date (DATE string, e.g. '2023-01-28'):
-    year   →  CAST(strftime('%Y', period_date) AS INTEGER)
-    month  →  CAST(strftime('%m', period_date) AS INTEGER)
-    Use period_date only when year_month is insufficient for the question.
-
-• Quarterly analysis → use quarter_nielsen + year_nielsen columns directly;
-  NEVER compute QUARTER() from anything.
-
-• Pagination / row-limiting → LIMIT N   (not TOP N)
-• NULL coalescing         → COALESCE(a, b)   (not NVL / ISNULL)
-• Current date            → date('now')      (not GETDATE() / NOW())
-• No trailing commas before FROM, WHERE, GROUP BY, ORDER BY, HAVING.
+{_DIALECT_RULES}
 
 ──────────────────────────────────────────────────────────────────────────
 CTE SKELETON  (adapt structure and names to the question)
 ──────────────────────────────────────────────────────────────────────────
 WITH <entity_cte> AS (
     SELECT SUM(sales_dollar) AS entity_sales
-    FROM {TABLE_NAME}
+    FROM {_TABLE_REF}
     WHERE <product_filter>
       AND <temporal_filter>               -- year_month / period_date / year_nielsen
       AND total = 'Total US xAOC + Conv'  -- or customer / division / market filter
 ),
 <market_cte> AS (
     SELECT SUM(sales_dollar) AS total_sales
-    FROM {TABLE_NAME}
+    FROM {_TABLE_REF}
     WHERE <broader_category_filter>
       AND <temporal_filter>
       AND total = 'Total US xAOC + Conv'
@@ -152,7 +173,7 @@ class SchemaLinkerAgent:
         self.column_selection_prompt = ChatPromptTemplate.from_messages([
             ("system", f"""You are a Nielsen POS data expert. The database contains exactly ONE table:
 
-  Table: {TABLE_NAME}
+  Table: {_TABLE_REF}
 
 FULL SCHEMA:
 {FULL_SCHEMA_TEXT}
@@ -243,7 +264,7 @@ Comma-separated column names only:"""),
             dynamic_prompt = ChatPromptTemplate.from_messages([
                 ("system", f"""You are a Nielsen POS data expert. The database contains exactly ONE table:
 
-  Table: {TABLE_NAME}
+  Table: {_TABLE_REF}
 
 FILTERED SCHEMA (only categories relevant to this query):
 {schema_text}
@@ -323,7 +344,7 @@ Comma-separated column names only:"""),
         """
         Build a concise schema text block containing ONLY the selected columns.
         """
-        lines = [f"TABLE: {TABLE_NAME}", "=" * 70]
+        lines = [f"TABLE: {_TABLE_REF}", "=" * 70]
         for group, cols in _COLUMNS.items():
             relevant = {col: desc for col, desc in cols.items() if col in columns}
             if relevant:
@@ -363,7 +384,9 @@ Comma-separated column names only:"""),
             logger.info("SCHEMA LINKER: No category pre-filter — using full schema")
 
         # Build per-category filtered schema text + restricted column list
-        filtered_schema_text = get_schema_for_categories(valid_categories)
+        filtered_schema_text = get_schema_for_categories(
+            valid_categories, table_name_override=_TABLE_REF
+        )
         candidate_cols: List[str] = [
             col
             for cat in valid_categories
@@ -392,12 +415,12 @@ Comma-separated column names only:"""),
                         }
 
             logger.info(
-                f"Schema context ready — table='{TABLE_NAME}', "
+                f"Schema context ready — table='{_TABLE_REF}', "
                 f"columns selected={len(selected_cols)}"
             )
 
             return {
-                "relevant_tables": [TABLE_NAME],
+                "relevant_tables": [_TABLE_REF],
                 "schema_context": schema_context,
                 "schema_metadata": schema_metadata,
             }
@@ -406,7 +429,7 @@ Comma-separated column names only:"""),
             logger.error(f"Schema retrieval error: {e}")
             # Fallback: full schema so generation can still proceed
             return {
-                "relevant_tables": [TABLE_NAME],
+                "relevant_tables": [_TABLE_REF],
                 "schema_context": FULL_SCHEMA_TEXT + CTE_CONVENTIONS,
                 "schema_metadata": {},
                 "error": f"Schema retrieval failed: {str(e)}",

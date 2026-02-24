@@ -10,6 +10,55 @@ from loguru import logger
 from core.state import AgentState
 from config import settings
 
+# Provider-aware table name substituted into few-shot example SQL at injection time.
+_TABLE_REF: str = (
+    settings.dbx_full_table
+    if settings.llm_provider.lower() == "dbrx"
+    else "nielsen_pos"
+)
+
+
+def _fix_dbrx_table_quoting(sql: str) -> str:
+    """
+    Normalise the fully-qualified Databricks table reference in generated SQL.
+
+    LLMs occasionally quote catalog/schema/table parts with single or double
+    quotes instead of backticks, or omit quotes entirely, producing invalid SQL:
+
+        FROM 'dev-amer-customer-catalog'.'schema'.'table'   -- single-quoted
+        FROM "dev-amer-customer-catalog"."schema"."table"   -- double-quoted
+        FROM dev-amer-customer-catalog.schema.table         -- unquoted
+
+    We replace every such variant with the canonical backtick form from settings.
+    Four explicit patterns cover single-quoted, double-quoted, backtick (already
+    correct but re-normalised for safety), and unquoted.
+    """
+    cat   = re.escape(settings.dbx_catalog)
+    sch   = re.escape(settings.dbx_schema_name)
+    tbl   = re.escape(settings.dbx_table)
+    canon = settings.dbx_full_table   # `cat`.`sch`.`tbl`
+
+    # Build one pattern per quoting style: single, double, backtick, none.
+    _variants = [
+        rf"'{{cat}}'\.'{{sch}}'\.'{{tbl}}'",       # 'cat'.'sch'.'tbl'
+        rf"\"{{cat}}\"\.\"{{sch}}\"\.\"{{tbl}}\"",  # "cat"."sch"."tbl"
+        rf"`{{cat}}`\.`{{sch}}`\.`{{tbl}}`",       # `cat`.`sch`.`tbl`  (already correct)
+        rf"{{cat}}\.{{sch}}\.{{tbl}}",              # cat.sch.tbl  (no quotes)
+    ]
+    # Substitute the actual escaped names into each pattern string.
+    patterns = [
+        v.format(cat=cat, sch=sch, tbl=tbl)
+        for v in _variants
+    ]
+
+    fixed = sql
+    for pat in patterns:
+        fixed = re.sub(pat, canon, fixed, flags=re.IGNORECASE)
+
+    if fixed != sql:
+        logger.info("Generator: normalised Databricks table reference quoting in generated SQL.")
+    return fixed
+
 
 _BASE_SYSTEM = """\
 You are an expert SQL engineer for a Nielsen retail analytics platform.
@@ -64,13 +113,20 @@ example carefully before writing your query.
 
 
 def _build_few_shot_block(examples: list) -> str:
-    """Render few-shot examples as an inline system-prompt section."""
+    """Render few-shot examples as an inline system-prompt section.
+
+    Any ``{table_name}`` placeholder in the YAML SQL is replaced with the
+    provider-specific table reference so dbrx examples show the fully-qualified
+    Databricks table name rather than the literal placeholder text.
+    """
     if not examples:
         return ""
     parts = []
     for i, ex in enumerate(examples, 1):
         q   = ex.get("question", "").strip()
         sql = ex.get("sql", "").strip()
+        # Substitute the YAML {table_name} placeholder with the real table ref
+        sql = sql.replace("{table_name}", _TABLE_REF)
         parts.append(f"Example {i}:\n  Question: {q}\n  SQL:\n{sql}\n")
     rendered = "\n".join(parts)
     return _FEW_SHOT_HEADER.format(examples=rendered)
@@ -301,9 +357,12 @@ class SQLGeneratorAgent:
 
         sql = sql.strip()
 
-        # Auto-patch SQLite incompatible functions (YEAR, MONTH, QUARTER, etc.)
-        # Only needed for local SQLite — skip when querying Databricks directly.
-        if settings.llm_provider.lower() != "dbrx":
+        # For dbrx: normalise any incorrect quoting of the fully-qualified table
+        # name (LLMs sometimes emit single/double quotes instead of backticks).
+        if settings.llm_provider.lower() == "dbrx":
+            sql = _fix_dbrx_table_quoting(sql)
+        else:
+            # Auto-patch SQLite incompatible functions (YEAR, MONTH, QUARTER, etc.)
             sql = _fix_sqlite_compat(sql)
 
         return sql

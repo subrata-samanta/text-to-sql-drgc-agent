@@ -5,12 +5,78 @@ Examples are sourced from nielsen_few_shots.yaml.
 
 from typing import List, Dict
 from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from loguru import logger
 from config import settings
 import os
 import yaml
+
+
+def _build_embeddings() -> Embeddings:
+    """
+    Return the appropriate embedding model for the active provider.
+
+    groq  → HuggingFace all-MiniLM-L6-v2  (local, no API cost)
+    dbrx  → Databricks embedding model via OpenAI-compatible endpoint.
+
+            DBRX_EMBEDDING_ENDPOINT_URL should be the full invocations URL, e.g.:
+              https://<workspace>.gcp.databricks.com/serving-endpoints
+                /databricks-gte-large-en/invocations
+
+            The base_url (everything up to and including /serving-endpoints)
+            and model name are derived automatically from that URL.
+    """
+    if settings.llm_provider.lower() == "dbrx":
+        from langchain_openai import OpenAIEmbeddings
+
+        endpoint_url = settings.dbrx_embedding_endpoint_url.strip()
+        if not endpoint_url:
+            raise ValueError(
+                "DBRX_EMBEDDING_ENDPOINT_URL is not set in .env. "
+                "Set it to the full Databricks invocations URL, e.g.: "
+                "https://<workspace>/serving-endpoints/databricks-gte-large-en/invocations"
+            )
+
+        # Derive base_url and model from the full invocations URL.
+        # URL shape: {workspace}/serving-endpoints/{model}/invocations
+        stripped = endpoint_url.rstrip("/")
+        if stripped.endswith("/invocations"):
+            stripped = stripped[: -len("/invocations")]
+        # stripped is now: {workspace}/serving-endpoints/{model}
+        base_url, _, model = stripped.rpartition("/")
+        # base_url: https://<workspace>/serving-endpoints
+
+        logger.info(
+            f"Embeddings: Databricks '{model}' "
+            f"via {base_url}"
+        )
+        return OpenAIEmbeddings(
+            model=model,
+            api_key=settings.dbrx_api_key,
+            base_url=base_url,
+            # Databricks endpoints only accept strings, not token-ID arrays.
+            # Disabling length checking prevents the OpenAI client from
+            # chunking long texts into token arrays before sending.
+            check_embedding_ctx_length=False,
+        )
+
+    # Default: local HuggingFace
+    from langchain_huggingface import HuggingFaceEmbeddings
+    logger.info(f"Embeddings: HuggingFace '{settings.embedding_model}' (local)")
+    return HuggingFaceEmbeddings(model_name=settings.embedding_model)
+
+
+def _collection_name() -> str:
+    """
+    Return a provider-scoped ChromaDB collection name.
+
+    HuggingFace and Databricks embeddings have different vector dimensions
+    (384 vs 1024+), so they MUST live in separate collections or ChromaDB
+    will raise a dimension-mismatch error.
+    """
+    suffix = "_dbrx" if settings.llm_provider.lower() == "dbrx" else "_hf"
+    return settings.chroma_collection_name + suffix
 
 
 class FewShotRetriever:
@@ -25,22 +91,26 @@ class FewShotRetriever:
             logger.info("Dynamic few-shot learning disabled")
             return
         
-        # Initialize embeddings with HuggingFace model (local)
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=settings.embedding_model
-        )
+        # Provider-aware embedding model
+        self.embeddings = _build_embeddings()
+
+        # Provider-scoped collection (prevents dimension-mismatch between groq/dbrx)
+        self._collection_name = _collection_name()
         
         # Initialize vector store
         persist_directory = settings.vector_store_path
         os.makedirs(persist_directory, exist_ok=True)
         
         self.vectorstore = Chroma(
-            collection_name=settings.chroma_collection_name,
+            collection_name=self._collection_name,
             embedding_function=self.embeddings,
             persist_directory=persist_directory
         )
         
-        logger.info(f"Few-shot retriever initialized with ChromaDB")
+        logger.info(
+            f"Few-shot retriever initialised — collection='{self._collection_name}', "
+            f"provider='{settings.llm_provider}'"
+        )
         
         # Auto-seed from YAML when the collection is empty
         if self.vectorstore._collection.count() == 0:
@@ -256,7 +326,7 @@ def seed_examples(yaml_path: str = None):
 
     # Re-initialise the collection after clear()
     few_shot_retriever.vectorstore = Chroma(
-        collection_name=settings.chroma_collection_name,
+        collection_name=few_shot_retriever._collection_name,
         embedding_function=few_shot_retriever.embeddings,
         persist_directory=settings.vector_store_path,
     )

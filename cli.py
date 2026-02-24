@@ -634,6 +634,11 @@ def interactive_loop(show_steps: bool = True, stream: bool = True):
 # ─── entry point ──────────────────────────────────────────────────────────────
 
 def main():
+    # Pre-warm the filter-resolver value cache in the background while the
+    # argument parser and other startup work runs.
+    from agents.filter_resolver import initialize_value_cache
+    initialize_value_cache()
+
     parser = argparse.ArgumentParser(
         description="Nielsen Text-to-SQL Agent — CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,

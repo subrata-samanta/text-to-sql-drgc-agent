@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     # ── Provider selection ────────────────────────────────────────────────────
     # "groq"  → Groq LLMs + local SQLite + HuggingFace embeddings (default)
-    # "dbrx"  → Databricks Gemini model + Databricks SQL + HuggingFace embeddings
+    # "dbrx"  → Databricks Gemini model + Databricks SQL + Databricks embeddings
     llm_provider: str = Field(default="groq", env="LLM_PROVIDER")
 
     # ── Groq Configuration ────────────────────────────────────────────────────
@@ -49,8 +49,15 @@ class Settings(BaseSettings):
     vector_store_path: str = Field(default="./data/vector_store", env="VECTOR_STORE_PATH")
     chroma_collection_name: str = Field(default="sql_examples", env="CHROMA_COLLECTION_NAME")
 
-    # ── Embedding Configuration (HuggingFace — local, used by both providers) ─
+    # ── Embedding Configuration ──────────────────────────────────────────────
+    # groq provider → HuggingFace local model (no API cost, runs offline)
     embedding_model: str = Field(default="all-MiniLM-L6-v2", env="EMBEDDING_MODEL")
+    # dbrx provider → Databricks embedding model via OpenAI-compatible endpoint
+    dbrx_embedding_model: str = Field(default="databricks-gte-large-en", env="DBRX_EMBEDDING_MODEL")
+    # Full Databricks serving-endpoint invocations URL for embeddings, e.g.:
+    # https://<workspace>.gcp.databricks.com/serving-endpoints/databricks-gte-large-en/invocations
+    # base_url and model are derived automatically from this URL.
+    dbrx_embedding_endpoint_url: str = Field(default="", env="DBRX_EMBEDDING_ENDPOINT_URL")
 
     # ── Caching Configuration (Disk Cache) ────────────────────────────────────
     # Off by default — enable at runtime via the UI toggle, --cache CLI flag,

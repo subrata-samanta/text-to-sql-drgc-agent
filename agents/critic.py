@@ -7,6 +7,31 @@ from loguru import logger
 from core.state import AgentState
 from core.database import db_manager
 from core.llm_factory import create_llm
+from config import settings
+
+# Provider-aware dialect hints injected into the reflection prompt.
+_DB_CORRECTION_HINTS: str = (
+    """\
+CRITICAL — THIS DATABASE IS Databricks SparkSQL:
+- year_month is a YYYYMM INTEGER (e.g. 202301); YEAR(year_month) is valid but
+  prefer year_nielsen column for year-level filtering.
+- YEAR(), MONTH(), QUARTER(), CURRENT_DATE(), COALESCE(), NVL() are all supported.
+- Use LIMIT N (not TOP N) for row limiting.
+- No trailing commas before FROM / GROUP BY / ORDER BY / HAVING."""
+    if settings.llm_provider.lower() == "dbrx"
+    else """\
+CRITICAL — THIS IS SQLite (NOT MySQL / SQL Server):
+- "no such function: YEAR"    → replace YEAR(col) with: year_nielsen column OR (year_month / 100)
+- "no such function: MONTH"   → replace MONTH(col) with: year_month % 100
+- "no such function: QUARTER" → use quarter_nielsen column directly
+- "no such function: NOW"     → use date('now')
+- "no such function: GETDATE"  → use date('now')
+- "no such function: ISNULL"  → use COALESCE(a, b)
+- "no such function: NVL"     → use COALESCE(a, b)
+- "near FROM: syntax error"   → remove trailing comma before FROM / GROUP BY / ORDER BY
+- TOP N not supported         → use LIMIT N
+- year_month is a YYYYMM INTEGER (e.g. 202301); do NOT wrap it in YEAR() or strftime()"""
+)
 
 
 class CriticAgent:
@@ -20,6 +45,7 @@ class CriticAgent:
         
         # Prompt for error correction
         self.reflection_prompt = ChatPromptTemplate.from_messages([
+            # NOTE: {db_hints} is a real template variable filled at invoke() time.
             ("system", """You are a SQL debugging expert. A query failed and you must fix it.
 
 Your Task:
@@ -35,17 +61,7 @@ Common Error Patterns:
 - Ambiguous column → Add table aliases
 - Join error → Verify foreign key relationships
 
-CRITICAL — THIS IS SQLite (NOT MySQL / SQL Server):
-- "no such function: YEAR"    → replace YEAR(col) with: year_nielsen column OR (year_month / 100)
-- "no such function: MONTH"   → replace MONTH(col) with: year_month % 100
-- "no such function: QUARTER" → use quarter_nielsen column directly
-- "no such function: NOW"     → use date('now')
-- "no such function: GETDATE"  → use date('now')
-- "no such function: ISNULL"  → use COALESCE(a, b)
-- "no such function: NVL"     → use COALESCE(a, b)
-- "near FROM: syntax error"   → remove trailing comma before FROM / GROUP BY / ORDER BY
-- TOP N not supported         → use LIMIT N
-- year_month is a YYYYMM INTEGER (e.g. 202301); do NOT wrap it in YEAR() or strftime()
+{db_hints}
 
 IMPORTANT: Return ONLY the fixed SQL query (no explanations, no markdown)
 
@@ -163,7 +179,8 @@ Generate the CORRECTED SQL:"""),
                 "plan": plan,
                 "schema_context": schema_context,
                 "sql_query": sql_query,
-                "error": error
+                "error": error,
+                "db_hints": _DB_CORRECTION_HINTS,
             })
             
             # Clean the fixed SQL
