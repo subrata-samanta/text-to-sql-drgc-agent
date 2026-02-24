@@ -186,15 +186,26 @@ def direct_respond_node(state: AgentState) -> dict:
 
 def post_reflect_filter_node(state: AgentState) -> dict:
     """
-    After reflector rewrites the SQL, re-run filter value verification.
+    After reflector rewrites the SQL, re-run filter value verification ONLY if
+    the filter resolver has not already run for this query turn.
 
-    Why: the reflector may change WHERE literals while fixing column/join errors,
-    so the corrected SQL needs another filter-value pass.
+    Filter resolution is intentionally a one-shot operation per user query:
+    once the filter values have been corrected and the SQL rewritten, the
+    corrections should be treated as ground truth for all subsequent retry
+    loops.  Re-running the resolver on every reflection iteration would
+    waste LLM calls, risk double-correcting already-fixed values, and add
+    latency to every self-correction cycle.
 
-    Importance: we suppress needs_clarification here — we are inside the
-    self-correction loop and cannot interrupt to ask the user; just auto-apply
-    any corrections we can and continue.
+    The resolver IS skipped when ``filter_log`` is already present in state
+    (set by the filter_resolver node on the first pass).
     """
+    if state.get("filter_log") is not None:
+        logger.debug(
+            "post_reflect_filter: filter_log already present — "
+            "skipping (filter resolution is one-shot per query)."
+        )
+        return {}
+
     from agents.filter_resolver import FilterResolverAgent
     result = FilterResolverAgent().resolve(state)
     # Do not surface clarification inside the reflection loop

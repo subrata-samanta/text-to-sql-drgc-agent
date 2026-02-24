@@ -72,7 +72,7 @@ from core.state import AgentState
 _AUTO_CORRECT_THRESHOLD     = 0.55   # minimum combined score to auto-correct
 _HIERARCHY_AMBIGUITY_MARGIN = 0.10   # top-2 within this -> pick coarser level
 _MIN_STRING_SCORE_FOR_COARSER = 0.35 # Phase 3 override: coarser beats finer above this
-_MAX_DISTINCT               = 300    # max DB values per column
+_MAX_DISTINCT               = 1000   # max DB values per column
 _SKIP_COLUMNS: set = {
     "year_nielsen", "year", "period_num", "week_num", "month_num",
     "id", "row_id", "record_id",
@@ -1065,6 +1065,36 @@ def _resolve_one(
         hierarchy = _COLUMN_TO_HIERARCHY[effective_column]
         # Only pass values that belong to *this* hierarchy axis
         hierarchy_values = {col: cached_values.get(col, []) for col in hierarchy}
+
+        # If every level in the hierarchy has zero cached values the column was
+        # either excluded from _CACHED_COLUMNS (dbrx schema mismatch for sibling
+        # columns) or the warmup hasn't finished yet.  In that case, fetch the
+        # specific column's values on-demand and fall back to the simple resolver
+        # — we can still correct the value even without cross-level comparison.
+        total_hierarchy_vals = sum(len(v) for v in hierarchy_values.values())
+        if total_hierarchy_vals == 0:
+            logger.debug(
+                f"FilterResolver: hierarchy cache empty for '{effective_column}' axis "
+                f"({hierarchy}) — fetching on-demand from DB."
+            )
+            live_vals = _fetch_distinct(effective_column)
+            if live_vals:
+                logger.info(
+                    f"FilterResolver: on-demand fetch got {len(live_vals)} values "
+                    f"for '{effective_column}' — using simple resolver."
+                )
+                return _resolve_simple(llm, effective_column, guessed, live_vals)
+            # Truly no data for this column — nothing to correct
+            logger.warning(
+                f"FilterResolver: no values found for '{effective_column}' "
+                "(column may not exist in DB) — skipping correction."
+            )
+            return {
+                "match": guessed, "matched_column": effective_column,
+                "confidence": 1.0, "clarify": False, "question": None,
+                "interpretation": None,
+            }
+
         return _resolve_hierarchy_entity(
             llm, question, effective_column, guessed, hierarchy_values, hierarchy
         )
@@ -1126,7 +1156,10 @@ class FilterResolverAgent:
         interpretations: List[str] = []
         filter_log:      List[Dict] = []
 
-        with ThreadPoolExecutor(max_workers=min(len(filters), 6)) as pool:
+        # All filters are resolved in parallel — one thread per filter.
+        # max_workers is unbounded so every filter gets its own thread
+        # immediately (LLM calls are IO-bound; Python threads are fine).
+        with ThreadPoolExecutor(max_workers=len(filters)) as pool:
             futures = {
                 pool.submit(
                     _resolve_one,
