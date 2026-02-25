@@ -126,7 +126,7 @@ class DataLoader:
                 'dtypes': {col: str(dtype) for col, dtype in df.dtypes.items()}
             }
             
-            logger.info(f"✓ Loaded {stats['rows']} rows into table '{table_name}'")
+            logger.info(f"Loaded {stats['rows']} rows into table '{table_name}'")
             logger.debug(f"Columns: {', '.join(stats['column_names'])}")
             
             self.conn.close()
@@ -188,7 +188,7 @@ class DataLoader:
                 })
         
         successful = sum(1 for r in results if 'error' not in r)
-        logger.info(f"✓ Successfully loaded {successful}/{len(results)} files")
+        logger.info(f"Successfully loaded {successful}/{len(results)} files")
         
         return results
     
@@ -251,7 +251,7 @@ class DataLoader:
                     }
                     
                     results.append(stats)
-                    logger.info(f"✓ Loaded sheet '{sheet_name}' as table '{table_name}' ({len(df)} rows)")
+                    logger.info(f"Loaded sheet '{sheet_name}' as table '{table_name}' ({len(df)} rows)")
                     
                 except Exception as e:
                     logger.error(f"Failed to load sheet '{sheet_name}': {e}")

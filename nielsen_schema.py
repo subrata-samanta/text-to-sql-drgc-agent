@@ -17,7 +17,12 @@ schema = {
       """,
       "quarter_nielsen": """
         - type: STRING
-        - quarter_nielsen represents the quarter of the year and is extracted from the year_month column. Values = ['Q1', 'Q2', 'Q3', 'Q4']
+        - quarter_nielsen represents the quarter of the year and is extracted from the year_month column.
+        - IMPORTANT: quarter_nielsen values are ALWAYS STRINGS with a 'Q' prefix: 'Q1', 'Q2', 'Q3', 'Q4'.
+        - NEVER use bare integers (1, 2, 3, 4). ALWAYS use single-quoted strings with the Q prefix.
+        - CORRECT:   WHERE quarter_nielsen = 'Q1'
+        - INCORRECT: WHERE quarter_nielsen = 1   ← this will ALWAYS return zero rows
+        - Q1 = Jan-Mar, Q2 = Apr-Jun, Q3 = Jul-Sep, Q4 = Oct-Dec
       """,
       "year_nielsen": """
         - type: INT

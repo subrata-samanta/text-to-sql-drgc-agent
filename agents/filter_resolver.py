@@ -149,6 +149,20 @@ _ABBREVIATION_EXPANSIONS: Dict[str, Tuple[str, Optional[str]]] = {
     "halls cough drop"          : ("HALLS",                    "brand"),
     "mondelez small sub"        : ("MDLZ SMALL SUB",           "ppg"),
     "mdlz small sub"            : ("MDLZ SMALL SUB",           "ppg"),
+    # ── Additional seeds for frequently misclassified CPG entities ─────────
+    "chips ahoy"                : ("NAB CHIPS AHOY",           "brand"),
+    "nab chips ahoy"            : ("NAB CHIPS AHOY",           "brand"),
+    "tates"                     : ("TATES",                    "brand"),
+    "tate's"                    : ("TATES",                    "brand"),
+    "tate s"                    : ("TATES",                    "brand"),
+    "p&g"                       : ("P&G",                      "manufacturer"),
+    "procter & gamble"          : ("P&G",                      "manufacturer"),
+    "procter and gamble"        : ("P&G",                      "manufacturer"),
+    # ── Sub-category Nielsen code seeds ───────────────────────────────────
+    # These Nielsen codes are cryptic enough that the LLM cannot infer them;
+    # seed them here so no LLM call is needed for the fuzzy phase.
+    "butter cookie"             : ("CKY-BUTTER",               "sub_category"),
+    "butter cookies"            : ("CKY-BUTTER",               "sub_category"),
 }
 
 # In-process LRU-style expansion cache, pre-seeded from _ABBREVIATION_EXPANSIONS.
@@ -425,6 +439,23 @@ def _extract_string_filters(sql: str) -> List[Tuple[str, str]]:
             if isinstance(expr, exp.Literal) and expr.is_string:
                 results.append((col_name, expr.this))
 
+    # Walk every LIKE predicate: col LIKE '%pattern%'
+    # Extract the text between % wildcards so it can be entity-expanded and
+    # fuzzy-matched against DB values (e.g. '%Butter Cookie%' → 'Butter Cookie').
+    for node in tree.find_all(exp.Like):
+        col_node = node.this
+        if not isinstance(col_node, exp.Column):
+            continue
+        col_name = col_node.name.lower()
+        if col_name in _SKIP_COLUMNS:
+            continue
+        pattern_node = node.expression
+        if isinstance(pattern_node, exp.Literal) and pattern_node.is_string:
+            # Strip leading/trailing % wildcards to get the bare search term
+            raw_pattern = pattern_node.this.strip("%").strip()
+            if raw_pattern:
+                results.append((col_name, raw_pattern))
+
     # De-duplicate while preserving order
     seen: set = set()
     unique = []
@@ -454,7 +485,11 @@ def _rewrite_sql(
     if column_corrections:
         for (old_col, old_val), (new_col, new_val) in column_corrections.items():
             if old_col == new_col:
-                continue  # handled below as a value correction
+                # Same-column rule (e.g. candy → NON CHOCOLATE in same column).
+                # Treat as a value correction so the replacement actually fires.
+                value_corrections = dict(value_corrections)  # make mutable copy
+                value_corrections[(old_col, old_val)] = new_val
+                continue
             # col = 'old_val'  ->  new_col = 'new_val'
             pattern = re.compile(
                 r"(?i)\b" + re.escape(old_col)
@@ -465,7 +500,12 @@ def _rewrite_sql(
             in_pattern = re.compile(r"(?i)\b" + re.escape(old_col) + r"(\s+IN\s*\()")
             result = in_pattern.sub(lambda m, nc=new_col: f"{nc}{m.group(1)}", result)
             # Swap any remaining literal occurrences inside IN list
-            result = result.replace(f"'{old_val}'", f"'{new_val}'")
+            # Handle both plain and SQL-escaped (doubled-apostrophe) forms
+            sql_escaped_old = old_val.replace("'", "''")
+            sql_escaped_new = new_val.replace("'", "''")
+            result = result.replace(f"'{sql_escaped_old}'", f"'{sql_escaped_new}'")
+            if sql_escaped_old != old_val:
+                result = result.replace(f"'{old_val}'", f"'{new_val}'")
 
     # 2. Same-column value corrections
     for (col, old_val), new_val in value_corrections.items():
@@ -475,7 +515,12 @@ def _rewrite_sql(
             r"(?i)(\b" + re.escape(col) + r"\s*=\s*')(" + re.escape(old_val) + r")(')",
         )
         result = pattern.sub(lambda m, nv=new_val: m.group(1) + nv + m.group(3), result)
-        result = result.replace(f"'{old_val}'", f"'{new_val}'")
+        # Replace in IN lists — handle both plain and SQL-escaped apostrophes
+        sql_escaped_old = old_val.replace("'", "''")
+        sql_escaped_new = new_val.replace("'", "''")
+        result = result.replace(f"'{sql_escaped_old}'", f"'{sql_escaped_new}'")
+        if sql_escaped_old != old_val:
+            result = result.replace(f"'{old_val}'", f"'{new_val}'")
 
     return result
 
@@ -508,7 +553,8 @@ _COLUMN_SYNONYMS: Dict[str, str] = {
     "brand_name":        "brand",
     "item":              "brand",
     "sku":               "brand",
-    "product_name":      "brand",
+    # NOTE: product_name is a real DB column — do NOT alias it to brand.
+    #       It is in _KNOWN_DB_COLUMNS and handled by _resolve_simple.
     # ── subbrand ──────────────────────────────────────────────────────────
     "sub_brand":         "subbrand",
     "subbrand_name":     "subbrand",
@@ -544,6 +590,8 @@ _COLUMN_SYNONYMS: Dict[str, str] = {
 _KNOWN_DB_COLUMNS: set = {
     "mega_category", "manufacturer", "category", "sub_category",
     "brand", "subbrand", "ppg", "market", "customer", "division",
+    # real product-level columns — must NOT be aliased to other columns
+    "product_name", "upc", "pack", "pack_type",
 }
 
 
@@ -1625,7 +1673,7 @@ class FilterResolverAgent:
             intro = "Before I run the query, I need a quick clarification:\n\n"
             if interpretations:
                 intro = (
-                    "ℹ️ " + " | ".join(interpretations) + "\n\n" + intro
+                    "Note: " + " | ".join(interpretations) + "\n\n" + intro
                 )
             intro += "\n".join(f"• {q}" for q in clarifications)
             out["direct_response"]     = intro

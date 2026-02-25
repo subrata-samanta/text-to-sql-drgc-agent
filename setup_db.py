@@ -82,7 +82,7 @@ Examples:
         
         # Show summary
         print("\n" + "="*70)
-        print("✓ DATABASE SETUP SUCCESSFUL")
+        print("DATABASE SETUP SUCCESSFUL")
         print("="*70)
         
         db_info = result['database_info']
@@ -91,7 +91,7 @@ Examples:
         
         print("\nTables Created:")
         for table in db_info['tables']:
-            print(f"  • {table['table_name']:<30} {table['row_count']:>8} rows  {table['column_count']:>3} columns")
+            print(f"  - {table['table_name']:<30} {table['row_count']:>8} rows  {table['column_count']:>3} columns")
         
         if args.show_info:
             print("\nDetailed Table Information:")
@@ -115,13 +115,13 @@ Examples:
         
     except FileNotFoundError as e:
         logger.error(f"File not found: {e}")
-        print(f"\n✗ Error: {e}")
+        print(f"\nError: {e}")
         print("\nPlease check that the file or directory exists.")
         return 1
         
     except Exception as e:
         logger.error(f"Error setting up database: {e}")
-        print(f"\n✗ Error: {e}")
+        print(f"\nError: {e}")
         import traceback
         traceback.print_exc()
         return 1

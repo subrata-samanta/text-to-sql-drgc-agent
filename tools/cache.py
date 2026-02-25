@@ -99,10 +99,10 @@ class SemanticCache:
                         best_match = cached_data
 
             if best_match:
-                logger.info(f"✓ Cache HIT (similarity: {best_similarity:.3f})")
+                logger.info(f"Cache HIT (similarity: {best_similarity:.3f})")
                 return best_match["result"]
             else:
-                logger.info("✗ Cache MISS")
+                logger.info("Cache MISS")
                 return None
 
         except Exception as e:
@@ -133,7 +133,7 @@ class SemanticCache:
                 "result":    result,
             }
             self._cache[key] = cache_data
-            logger.info("✓ Cached result for question")
+            logger.info("Cached result for question")
 
         except Exception as e:
             logger.error(f"Cache storage error: {e}")
