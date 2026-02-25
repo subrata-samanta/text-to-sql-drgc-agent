@@ -69,10 +69,17 @@ from core.database import db_manager
 from core.state import AgentState
 
 # ── tunables ──────────────────────────────────────────────────────────────────
-_AUTO_CORRECT_THRESHOLD     = 0.55   # minimum combined score to auto-correct
-_HIERARCHY_AMBIGUITY_MARGIN = 0.10   # top-2 within this -> pick coarser level
-_MIN_STRING_SCORE_FOR_COARSER = 0.35 # Phase 3 override: coarser beats finer above this
-_MAX_DISTINCT               = 1000   # max DB values per column
+_AUTO_CORRECT_THRESHOLD       = 0.50   # minimum combined score to auto-correct
+_HIERARCHY_AMBIGUITY_MARGIN   = 0.10   # top-2 within this -> pick coarser level
+_MIN_STRING_SCORE_FOR_COARSER = 0.30   # Phase 3 override: coarser beats finer above this
+_MAX_DISTINCT                 = 1000   # max DB values per column
+# String-similarity weight dominates so exact/near-exact matches at a different
+# hierarchy level win over poor-string-match same-level candidates.
+_STRING_WEIGHT                = 0.65   # weight for string-similarity in combined score
+_LEVEL_WEIGHT                 = 0.35   # weight for level-alignment in combined score
+# Minimum string similarity for a cross-level candidate to be auto-promoted
+# (avoids promoting weak fuzzy matches just because they sit at the right level).
+_CROSS_LEVEL_EXACT_THRESHOLD  = 0.88   # used in the cross-level exact-match guard
 _SKIP_COLUMNS: set = {
     "year_nielsen", "year", "period_num", "week_num", "month_num",
     "id", "row_id", "record_id",
@@ -94,16 +101,203 @@ _SKIP_COLUMNS: set = {
 #   force_column       — canonical DB column to write
 #   force_value        — canonical DB value to write (exact, case-sensitive)
 _BUSINESS_RULE_OVERRIDES: List[Dict] = [
+    # ── Keep ONLY rules where the correct DB value is COUNTER-INTUITIVE even
+    # to a CPG-savvy LLM (i.e. a perfect expansion still can't predict the
+    # exact Nielsen canonical string or the target column).
+    #
+    # Everything else (abbreviations, misspellings, wrong-column placements
+    # that a CPG expert would recognise) is now handled dynamically by
+    # _llm_expand_entity — no code changes needed for new product names.
     {
-        # "candy" in the question → category = 'NON CHOCOLATE'
-        # Catches LLM-hallucinated values like: candy, CANDY, Candy Bars,
-        # non-chocolate candy, non chocolate candy, etc.
+        # "candy" almost always means the NON CHOCOLATE *category* in Nielsen
+        # nomenclature.  LLMs consistently hallucinate the value as 'CANDY',
+        # 'CANDY BARS', 'CONFECTIONERY', etc.  This mapping is genuinely
+        # counter-intuitive without deep Nielsen schema knowledge.
         "question_keywords": ["candy"],
         "value_keywords":    ["candy", "non chocolate", "nonchocolate"],
         "force_column":      "category",
         "force_value":       "NON CHOCOLATE",
     },
 ]
+
+# ── Known Nielsen abbreviation / misspelling seed cache ──────────────────────
+# Pre-seeds the LLM expansion cache so frequently-seen abbreviations cost zero
+# LLM calls.  The LLM handles anything NOT present here automatically.
+#
+# Format — lowercase key : (canonical_expansion, preferred_column_hint | None)
+# The preferred_column_hint is propagated to the hierarchy resolver so it
+# searches the right axis without relying on the (often wrong) SQL column.
+#
+# Add new entries here only for values the LLM consistently gets wrong due to
+# extremely terse abbreviations or Nielsen-specific naming quirks.  For the
+# vast majority of new CPG names, the LLM will resolve them correctly on its
+# own without any code changes.
+_ABBREVIATION_EXPANSIONS: Dict[str, Tuple[str, Optional[str]]] = {
+    # value (lower)              : (expanded_canonical,    preferred_column_hint)
+    "spk"                       : ("SOUR PATCH KIDS",         "subbrand"),
+    "swf"                       : ("SWEDISH FISH",             "subbrand"),
+    "swf tropical"              : ("SWEDISH FISH TROPICAL",    "subbrand"),
+    "mdlz"                      : ("MONDELEZ",                 "manufacturer"),
+    "nat valley"                : ("NATURE VALLEY",            "brand"),
+    "nat. valley"               : ("NATURE VALLEY",            "brand"),
+    "conify"                    : ("CONFECTIONARY",            "mega_category"),
+    "confectionery"             : ("CONFECTIONARY",            "mega_category"),
+    "nutter butter"             : ("NAB NUTTER BUTTER",        "brand"),
+    "wheat thins"               : ("NAB WHEAT THINS",          "brand"),
+    "nabisco wheat thins"       : ("NAB WHEAT THINS",          "brand"),
+    "halls cough drops"         : ("HALLS",                    "brand"),
+    "halls cough drop"          : ("HALLS",                    "brand"),
+    "mondelez small sub"        : ("MDLZ SMALL SUB",           "ppg"),
+    "mdlz small sub"            : ("MDLZ SMALL SUB",           "ppg"),
+}
+
+# In-process LRU-style expansion cache, pre-seeded from _ABBREVIATION_EXPANSIONS.
+# Populated on-demand by _llm_expand_entity for new/unseen names.
+# Thread-safe via _ENTITY_EXPANSION_LOCK.
+_ENTITY_EXPANSION_CACHE: Dict[str, Tuple[str, Optional[str]]] = dict(_ABBREVIATION_EXPANSIONS)
+_ENTITY_EXPANSION_LOCK  = threading.Lock()
+
+# ── LLM prompts for dynamic entity expansion ──────────────────────────────────
+_ENTITY_EXPAND_SYSTEM = """\
+You are a CPG (Consumer Packaged Goods) retail expert specializing in Nielsen
+IQ retail measurement data.
+
+Your task: given a product / brand / manufacturer / category name as typed by
+a business user (which may be an abbreviation, nickname, misspelling, or
+informal form), expand it to the most likely CANONICAL retail name as it would
+appear in a Nielsen database.
+
+Nielsen-specific conventions to apply:
+  • Nabisco brands carry the "NAB" prefix in Nielsen:
+      Wheat Thins → NAB WHEAT THINS,  Nutter Butter → NAB NUTTER BUTTER,
+      Oreo → NAB OREO,  Chips Ahoy → NAB CHIPS AHOY, etc.
+  • MDLZ / MNZ / Mondelez abbreviations → MONDELEZ (manufacturer)
+  • Subbrand short-hands:  SPK → SOUR PATCH KIDS (subbrand),
+      SWF → SWEDISH FISH (subbrand),  SWF Tropical → SWEDISH FISH TROPICAL
+  • Category misspellings:  Conify / Confify → CONFECTIONARY (mega_category)
+  • Manufacturer abbreviations:  PVM → PERFETTI VAN MELLE,
+      MARS WM → MARS WRIGLEY,  UNTDBISC → UNITED BISCUITS,
+      GEN MILLS → GENERAL MILLS,  KFT → KRAFT, etc.
+  • Drug / throat brands: "Halls Cough Drops" is a brand (not a manufacturer);
+      canonical Nielsen brand = HALLS
+  • Preserve prefixes that are already present (NAB, MDLZ, AO, etc.)
+
+Also identify the most likely Nielsen hierarchy column for this entity
+(one of: mega_category, category, sub_category, manufacturer, brand,
+subbrand, ppg, market, customer, division, total).
+Only set preferred_column when you are highly confident; otherwise null.
+
+If the name is already in standard canonical form return it UNCHANGED with
+confidence ≤ 0.40 so the caller knows no expansion was performed.
+
+Return ONLY a JSON object — no prose, no markdown fence:
+{
+  "expanded":         "<canonical name in UPPER CASE>",
+  "preferred_column": "<column name or null>",
+  "confidence":       <0.0-1.0>,
+  "reasoning":        "<one sentence>"
+}
+"""
+
+_ENTITY_EXPAND_USER = """\
+User question (for context): {question}
+Entity as written in the SQL : {guessed}
+
+Return the JSON object now.
+"""
+
+
+def _llm_expand_entity(
+    llm,
+    guessed: str,
+    question: str = "",
+) -> Tuple[str, Optional[str]]:
+    """
+    Expand an abbreviated / misspelled CPG entity name to its canonical form.
+
+    Resolution order (fastest to slowest)
+    --------------------------------------
+    1. Exact lookup in ``_ENTITY_EXPANSION_CACHE`` — pre-seeded from
+       ``_ABBREVIATION_EXPANSIONS`` and populated on demand for new values.
+    2. Partial-prefix scan against the seed keys (e.g. ``"SWF Berry"``
+       matches the ``"swf"`` seed → ``"SWEDISH FISH BERRY"``).
+    3. LLM call — the result is cached so a second identical request is free.
+
+    Returns ``(expanded_value, preferred_column_hint)``.
+    Returns ``(guessed, None)`` unchanged when:
+      - the LLM confidence is < 0.65, or
+      - the LLM fails (network error, JSON parse error, etc.)
+    In those cases the original text is passed to the fuzzy scorer as-is.
+    """
+    key = guessed.lower().strip()
+
+    # 1. Exact cache hit
+    with _ENTITY_EXPANSION_LOCK:
+        if key in _ENTITY_EXPANSION_CACHE:
+            cached = _ENTITY_EXPANSION_CACHE[key]
+            if cached[0].upper() != guessed.upper():
+                logger.info(
+                    f"FilterResolver: entity cache hit '{guessed}' -> '{cached[0]}'"
+                    + (f" (col: {cached[1]})" if cached[1] else "")
+                )
+            return cached
+
+    # 2. Partial-prefix scan (e.g. "SWF Blind Melon" → "SWEDISH FISH BLIND MELON")
+    for abbr, (expanded, col_hint) in _ABBREVIATION_EXPANSIONS.items():
+        if key.startswith(abbr + " ") or key.endswith(" " + abbr):
+            suffix = (
+                key[len(abbr):].strip() if key.startswith(abbr)
+                else key[: -len(abbr)].strip()
+            )
+            full_expansion = (expanded + " " + suffix).strip().upper()
+            outcome: Tuple[str, Optional[str]] = (full_expansion, col_hint)
+            logger.info(
+                f"FilterResolver: partial-seed expansion '{guessed}' -> '{full_expansion}'"
+            )
+            with _ENTITY_EXPANSION_LOCK:
+                _ENTITY_EXPANSION_CACHE[key] = outcome
+            return outcome
+
+    # 3. LLM expansion (handles any unseen CPG name)
+    try:
+        resp = llm.invoke([
+            {"role": "system", "content": _ENTITY_EXPAND_SYSTEM},
+            {"role": "user",   "content": _ENTITY_EXPAND_USER.format(
+                question=question, guessed=guessed,
+            )},
+        ])
+        raw = resp.content.strip()
+        raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
+        raw = raw.replace("```", "").strip()
+        data       = json.loads(raw)
+        expanded   = (data.get("expanded") or guessed).strip().upper()
+        col_hint   = data.get("preferred_column") or None
+        confidence = float(data.get("confidence", 0.0))
+
+        if confidence >= 0.65 and expanded != guessed.upper():
+            outcome = (expanded, col_hint)
+            logger.info(
+                f"FilterResolver: LLM entity expansion '{guessed}' -> '{expanded}' "
+                f"(conf={confidence:.2f}"
+                + (f", col={col_hint}" if col_hint else "") + ") "
+                f"— {data.get('reasoning', '')}"
+            )
+        else:
+            # Not confident — return original; fuzzy scorer will try its best
+            outcome = (guessed, None)
+            logger.debug(
+                f"FilterResolver: LLM expansion '{guessed}' unchanged "
+                f"(conf={confidence:.2f})"
+            )
+    except Exception as exc:
+        logger.warning(f"FilterResolver: entity expansion LLM failed for '{guessed}' — {exc}")
+        outcome = (guessed, None)
+
+    # Cache result (including negative/unchanged results) to avoid repeated LLM calls
+    with _ENTITY_EXPANSION_LOCK:
+        _ENTITY_EXPANSION_CACHE[key] = outcome
+    return outcome
+
 
 # ── Three separate hierarchy groups (each is an independent coarsest→finest list) ──
 #
@@ -827,7 +1021,7 @@ def _resolve_hierarchy_entity(
         for val in values:
             s_score  = _fuzzy_score(guessed, val)
             l_score  = _level_alignment_score(level, intended_level, hierarchy)
-            combined = 0.4 * s_score + 0.6 * l_score
+            combined = _STRING_WEIGHT * s_score + _LEVEL_WEIGHT * l_score
             candidates.append({
                 "value": val, "level": level,
                 "s_score": s_score, "l_score": l_score, "combined": combined,
@@ -843,6 +1037,40 @@ def _resolve_hierarchy_entity(
 
     candidates.sort(key=lambda x: x["combined"], reverse=True)
     top = candidates[0]
+
+    # ── Cross-level exact-match guard ──────────────────────────────────────
+    # If ANY candidate (regardless of level) has a very high string similarity
+    # (>= _CROSS_LEVEL_EXACT_THRESHOLD) it almost certainly IS the right entity
+    # even if it sits at a different hierarchy level than the SQL column.
+    # Return it immediately before any level-alignment logic can override it.
+    # This fixes cases like: manufacturer='NATURE VALLEY' when the DB only has
+    # brand='NATURE VALLEY' — the string score 1.0 at brand should always win.
+    cross_exact: Optional[dict] = None
+    for cand in candidates:
+        if cand["s_score"] >= _CROSS_LEVEL_EXACT_THRESHOLD:
+            if cross_exact is None or cand["s_score"] > cross_exact["s_score"]:
+                cross_exact = cand
+
+    if cross_exact is not None and cross_exact["level"] != sql_column:
+        corrected_val = cross_exact["value"]
+        interp = (
+            f"Interpreted **'{guessed}'** as **{cross_exact['level']}** = "
+            f"'**{corrected_val}**' (exact match at different hierarchy level)"
+        )
+        logger.info(
+            f"FilterResolver: cross-level exact-match guard — promoting "
+            f"'{guessed}' from '{sql_column}' to "
+            f"'{cross_exact['level']}'='{corrected_val}' "
+            f"(s_score={cross_exact['s_score']:.2f})"
+        )
+        return {
+            "match":          corrected_val,
+            "matched_column": cross_exact["level"],
+            "confidence":     cross_exact["combined"],
+            "clarify":        False,
+            "question":       None,
+            "interpretation": interp,
+        }
 
     # ── Perfect-match guard ────────────────────────────────────────────────
     # If a candidate at the SAME level as sql_column has an exact or near-exact
@@ -1117,6 +1345,28 @@ def _resolve_one(
 
     ``cached_values`` is the full dict returned by _get_all_cached_values().
     """
+    # ── Entity expansion (abbreviations, misspellings, CPG nicknames) ────────
+    # Expands the SQL value to its canonical CPG entity name BEFORE fuzzy
+    # scoring so that e.g. "SPK" → "SOUR PATCH KIDS" rather than scoring ~0
+    # against all DB values.
+    #
+    # Resolution order (see _llm_expand_entity for full details):
+    #   1. In-process cache (pre-seeded from _ABBREVIATION_EXPANSIONS — free)
+    #   2. Partial-prefix scan against seed keys (free)
+    #   3. LLM call with result cached — handles unseen CPG names without any
+    #      code changes, making the resolver fully scalable to new products.
+    expanded_guessed, col_hint = _llm_expand_entity(llm, guessed, question)
+    if expanded_guessed != guessed:
+        # If the expansion supplies a preferred column hint, trust it over the
+        # LLM-generated column name (which is often wrong for abbreviations).
+        if col_hint and col_hint in _ALL_HIERARCHY_COLUMNS:
+            logger.info(
+                f"FilterResolver: using column hint '{col_hint}' from "
+                f"abbreviation expansion (overrides SQL column '{column}')"
+            )
+            column = col_hint
+        guessed = expanded_guessed
+
     # Normalise hallucinated column names first
     real_column = _suggest_column(column) if column not in _KNOWN_DB_COLUMNS else column
     if real_column and real_column != column:
