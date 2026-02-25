@@ -78,6 +78,33 @@ _SKIP_COLUMNS: set = {
     "id", "row_id", "record_id",
 }
 
+# ── Hard-coded business-logic filter overrides ────────────────────────────────
+# When the user's question contains ANY of the ``question_keywords`` AND a SQL
+# filter value contains ANY of the ``value_keywords``, the filter is
+# immediately rewritten to (``force_column``, ``force_value``) with no LLM
+# call.  Add new rules here to encode additional business knowledge.
+#
+# Matching is always case-insensitive.  The check on ``value_keywords`` avoids
+# triggering the rule when the SQL already contains the correct canonical value.
+#
+# Rule fields:
+#   question_keywords  — at least one must appear in the user question
+#   value_keywords     — at least one must appear in the SQL filter literal
+#                        (use [""] to match ANY non-empty value)
+#   force_column       — canonical DB column to write
+#   force_value        — canonical DB value to write (exact, case-sensitive)
+_BUSINESS_RULE_OVERRIDES: List[Dict] = [
+    {
+        # "candy" in the question → category = 'NON CHOCOLATE'
+        # Catches LLM-hallucinated values like: candy, CANDY, Candy Bars,
+        # non-chocolate candy, non chocolate candy, etc.
+        "question_keywords": ["candy"],
+        "value_keywords":    ["candy", "non chocolate", "nonchocolate"],
+        "force_column":      "category",
+        "force_value":       "NON CHOCOLATE",
+    },
+]
+
 # ── Three separate hierarchy groups (each is an independent coarsest→finest list) ──
 #
 # Category taxonomy: a product belongs to one mega_category > category > sub_category.
@@ -1197,82 +1224,126 @@ class FilterResolverAgent:
         interpretations: List[str] = []
         filter_log:      List[Dict] = []
 
-        # All filters are resolved in parallel — one thread per filter.
-        # max_workers is unbounded so every filter gets its own thread
-        # immediately (LLM calls are IO-bound; Python threads are fine).
-        with ThreadPoolExecutor(max_workers=len(filters)) as pool:
-            futures = {
-                pool.submit(
-                    _resolve_one,
-                    self.llm,
-                    question,
-                    col,
-                    val,
-                    cached_values,
-                ): (col, val)
-                for col, val in filters
-            }
-            for future in as_completed(futures):
-                col, val = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    logger.error(f"FilterResolver: resolution failed for {col}='{val}': {exc}")
-                    result = {
-                        "match": val, "matched_column": col,
-                        "confidence": 0.0, "clarify": False,
-                        "question": None, "interpretation": None,
-                    }
+        # ── Business-rule pre-pass (no LLM, runs before the parallel loop) ───
+        # Any filter whose value matches a hard-coded rule is overridden
+        # immediately; the rest fall through to normal LLM-based resolution.
+        q_lower = question.lower()
+        filters_for_llm: List[Tuple[str, str]] = []
 
-                match          = result.get("match") or val
-                matched_column = result.get("matched_column") or col
-                confidence     = float(result.get("confidence", 0.0))
-                clarify        = result.get("clarify", False)
-                question_text  = result.get("question")
-                interpretation = result.get("interpretation")
+        for col, val in filters:
+            matched_rule: Optional[Dict] = None
+            val_lower = val.lower().strip()
 
-                log_entry = {
+            for rule in _BUSINESS_RULE_OVERRIDES:
+                # Skip if question doesn't match
+                if not any(kw in q_lower for kw in rule["question_keywords"]):
+                    continue
+                # Skip if value doesn't match (already canonical → leave alone)
+                if val.strip() == rule["force_value"]:
+                    continue
+                if not any(kw in val_lower for kw in rule["value_keywords"]):
+                    continue
+                matched_rule = rule
+                break
+
+            if matched_rule:
+                fc = matched_rule["force_column"]
+                fv = matched_rule["force_value"]
+                logger.info(
+                    f"FilterResolver: BUSINESS RULE — "
+                    f"'{col}'='{val}' forced to '{fc}'='{fv}'"
+                )
+                column_corrections[(col, val)] = (fc, fv)
+                filter_log.append({
                     "column":         col,
                     "sql_value":      val,
-                    "db_match":       match,
-                    "matched_column": matched_column,
-                    "confidence":     confidence,
+                    "db_match":       fv,
+                    "matched_column": fc,
+                    "confidence":     1.0,
+                    "action":         "business_rule",
+                })
+            else:
+                filters_for_llm.append((col, val))
+
+        # Replace filters list: only unresolved filters go to the LLM loop
+        filters = filters_for_llm
+
+        # All remaining filters (not handled by business rules) are resolved
+        # in parallel via LLM — one thread per filter.
+        if filters:
+            with ThreadPoolExecutor(max_workers=len(filters)) as pool:
+                futures = {
+                    pool.submit(
+                        _resolve_one,
+                        self.llm,
+                        question,
+                        col,
+                        val,
+                        cached_values,
+                    ): (col, val)
+                    for col, val in filters
                 }
+                for future in as_completed(futures):
+                    col, val = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        logger.error(f"FilterResolver: resolution failed for {col}='{val}': {exc}")
+                        result = {
+                            "match": val, "matched_column": col,
+                            "confidence": 0.0, "clarify": False,
+                            "question": None, "interpretation": None,
+                        }
 
-                if interpretation:
-                    interpretations.append(interpretation)
+                    match          = result.get("match") or val
+                    matched_column = result.get("matched_column") or col
+                    confidence     = float(result.get("confidence", 0.0))
+                    clarify        = result.get("clarify", False)
+                    question_text  = result.get("question")
+                    interpretation = result.get("interpretation")
 
-                if clarify or confidence < _AUTO_CORRECT_THRESHOLD:
-                    logger.warning(
-                        f"FilterResolver: '{col}'='{val}' — "
-                        f"low confidence ({confidence:.2f}), needs clarification"
-                    )
-                    if question_text:
-                        clarifications.append(question_text)
-                    log_entry["action"] = "clarify"
+                    log_entry = {
+                        "column":         col,
+                        "sql_value":      val,
+                        "db_match":       match,
+                        "matched_column": matched_column,
+                        "confidence":     confidence,
+                    }
 
-                elif matched_column != col:
-                    # Cross-column correction: hierarchy level changed
-                    logger.info(
-                        f"FilterResolver: '{col}'='{val}' -> "
-                        f"'{matched_column}'='{match}' "
-                        f"(conf={confidence:.2f}) — cross-column correction"
-                    )
-                    column_corrections[(col, val)] = (matched_column, match)
-                    log_entry["action"] = "column_corrected"
+                    if interpretation:
+                        interpretations.append(interpretation)
 
-                elif match != val:
-                    logger.info(
-                        f"FilterResolver: '{col}' '{val}' -> '{match}' "
-                        f"(conf={confidence:.2f}) — value corrected"
-                    )
-                    value_corrections[(col, val)] = match
-                    log_entry["action"] = "corrected"
+                    if clarify or confidence < _AUTO_CORRECT_THRESHOLD:
+                        logger.warning(
+                            f"FilterResolver: '{col}'='{val}' — "
+                            f"low confidence ({confidence:.2f}), needs clarification"
+                        )
+                        if question_text:
+                            clarifications.append(question_text)
+                        log_entry["action"] = "clarify"
 
-                else:
-                    log_entry["action"] = "unchanged"
+                    elif matched_column != col:
+                        # Cross-column correction: hierarchy level changed
+                        logger.info(
+                            f"FilterResolver: '{col}'='{val}' -> "
+                            f"'{matched_column}'='{match}' "
+                            f"(conf={confidence:.2f}) — cross-column correction"
+                        )
+                        column_corrections[(col, val)] = (matched_column, match)
+                        log_entry["action"] = "column_corrected"
 
-                filter_log.append(log_entry)
+                    elif match != val:
+                        logger.info(
+                            f"FilterResolver: '{col}' '{val}' -> '{match}' "
+                            f"(conf={confidence:.2f}) — value corrected"
+                        )
+                        value_corrections[(col, val)] = match
+                        log_entry["action"] = "corrected"
+
+                    else:
+                        log_entry["action"] = "unchanged"
+
+                    filter_log.append(log_entry)
 
         # Apply corrections to SQL
         corrected_sql = sql
@@ -1280,12 +1351,14 @@ class FilterResolverAgent:
             corrected_sql = _rewrite_sql(sql, value_corrections, column_corrections)
 
         # Summary log
-        n_val    = sum(1 for e in filter_log if e["action"] == "corrected")
-        n_col    = sum(1 for e in filter_log if e["action"] == "column_corrected")
-        n_same   = sum(1 for e in filter_log if e["action"] == "unchanged")
-        n_clarify = sum(1 for e in filter_log if e["action"] == "clarify")
+        n_val      = sum(1 for e in filter_log if e["action"] == "corrected")
+        n_col      = sum(1 for e in filter_log if e["action"] == "column_corrected")
+        n_rule     = sum(1 for e in filter_log if e["action"] == "business_rule")
+        n_same     = sum(1 for e in filter_log if e["action"] == "unchanged")
+        n_clarify  = sum(1 for e in filter_log if e["action"] == "clarify")
         logger.info(
-            f"FilterResolver done: {n_val} value-corrected, "
+            f"FilterResolver done: {n_rule} business-rule, "
+            f"{n_val} value-corrected, "
             f"{n_col} column+value-corrected, "
             f"{n_same} unchanged, {n_clarify} need clarification"
         )
