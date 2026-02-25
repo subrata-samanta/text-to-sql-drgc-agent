@@ -206,8 +206,8 @@ def post_reflect_filter_node(state: AgentState) -> dict:
         )
         return {}
 
-    from agents.filter_resolver import FilterResolverAgent
-    result = FilterResolverAgent().resolve(state)
+    from agents.filter_resolver import _filter_resolver_agent
+    result = _filter_resolver_agent.resolve(state)
     # Do not surface clarification inside the reflection loop
     result.pop("needs_clarification", None)
     result.pop("direct_response", None)
@@ -466,9 +466,8 @@ def stream_nl_response(
         yield state.get("direct_response") or "I need more information before I can run this query."
         return
 
-    from agents.responder import NLResponderAgent
-    agent = NLResponderAgent()
-    yield from agent.stream_respond(state, conversation_history)
+    from agents.responder import _nl_responder_agent
+    yield from _nl_responder_agent.stream_respond(state, conversation_history)
 
 
 async def run_agent_async(

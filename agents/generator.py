@@ -409,12 +409,15 @@ class SQLGeneratorAgent:
         return sql
 
 
+# ── Module-level singleton ───────────────────────────────────────────────────
+# SQLGeneratorAgent is stateless beyond __init__; the generation_prompt and
+# self.llm are immutable after construction.
+_sql_generator_agent = SQLGeneratorAgent()
+
+
 # Node function for LangGraph
 def generator_node(state: AgentState) -> dict:
     """LangGraph node wrapper for SQLGeneratorAgent."""
-    agent = SQLGeneratorAgent()
-    
     # Get few-shot examples from state (retrieved in previous step)
     few_shot = state.get("few_shot_examples", None)
-    
-    return agent.generate(state, few_shot_examples=few_shot)
+    return _sql_generator_agent.generate(state, few_shot_examples=few_shot)

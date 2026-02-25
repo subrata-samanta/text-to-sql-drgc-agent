@@ -183,10 +183,9 @@ Generate the CORRECTED SQL:"""),
                 "db_hints": _DB_CORRECTION_HINTS,
             })
             
-            # Clean the fixed SQL
-            from agents.generator import SQLGeneratorAgent
-            generator = SQLGeneratorAgent()
-            fixed_sql = generator._clean_sql(response.content)
+            # Clean the fixed SQL (reuse the singleton to avoid re-construction)
+            from agents.generator import _sql_generator_agent as _generator
+            fixed_sql = _generator._clean_sql(response.content)
             
             logger.info(f"Generated corrected SQL (iteration {iterations + 1})")
             logger.debug(f"Fixed SQL: {fixed_sql}")
@@ -272,14 +271,18 @@ Generate the CORRECTED SQL:"""),
             return str(result)[:500]  # Truncate to 500 chars
 
 
+# ── Module-level singleton ───────────────────────────────────────────────────
+# CriticAgent is stateless beyond __init__; both the prompt template and
+# self.llm are immutable.  Sharing across threads is safe.
+_critic_agent = CriticAgent()
+
+
 # Node functions for LangGraph
 def executor_node(state: AgentState) -> dict:
     """LangGraph node wrapper for execution."""
-    agent = CriticAgent()
-    return agent.execute_and_validate(state)
+    return _critic_agent.execute_and_validate(state)
 
 
 def reflector_node(state: AgentState) -> dict:
     """LangGraph node wrapper for reflection/correction."""
-    agent = CriticAgent()
-    return agent.reflect_and_fix(state)
+    return _critic_agent.reflect_and_fix(state)

@@ -275,6 +275,12 @@ def _build_filter_correction(
     }
 
 
+# ── Module-level singleton ────────────────────────────────────────────────────
+# InteractionAgent is stateless beyond __init__; self.llm and self.chain are
+# immutable after construction.  The cached LLM is shared safely across threads.
+_interaction_agent = InteractionAgent()
+
+
 def interaction_node(state: AgentState) -> dict:
     """
     LangGraph node: classify intent, rewrite follow-up questions, set routing fields.
@@ -286,7 +292,7 @@ def interaction_node(state: AgentState) -> dict:
         user_feedback     — correction summary (correction intent only)
         previous_sql      — SQL from the prior turn being corrected
     """
-    agent   = InteractionAgent()
+    agent   = _interaction_agent
     history = state.get("conversation_history") or []
 
     # ── Fast-path: answering a filter clarification ───────────────────────

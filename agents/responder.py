@@ -449,9 +449,15 @@ class NLResponderAgent:
             yield state.get("result_preview") or "Query executed successfully."
 
 
+# ── Module-level singleton ───────────────────────────────────────────────────
+# NLResponderAgent only holds ChatPromptTemplate objects (immutable) after
+# __init__.  The LLM is obtained via _make_llm() → create_llm() which now
+# returns the globally cached instance.
+_nl_responder_agent = NLResponderAgent()
+
+
 # ── LangGraph node ───────────────────────────────────────────────────────────
 
 def responder_node(state: AgentState) -> dict:
     """LangGraph node wrapper for NLResponderAgent (non-streaming, for caching)."""
-    agent = NLResponderAgent()
-    return agent.respond(state)
+    return _nl_responder_agent.respond(state)

@@ -1159,7 +1159,12 @@ class FilterResolverAgent:
     """
 
     def __init__(self):
-        self.llm = create_llm("reasoning")
+        # The filter resolver's LLM tasks (intent classification and fuzzy
+        # value matching from a list) are well within the capability of the
+        # fast model.  Using "fast" here saves ≈1-2 s per filter without any
+        # accuracy loss — the heavy lifting is done by the algorithmic
+        # hierarchy-scoring logic, not by the LLM.
+        self.llm = create_llm("fast")
 
     def resolve(self, state: AgentState) -> dict:
         sql      = state.get("sql_query", "")
@@ -1319,7 +1324,14 @@ class FilterResolverAgent:
 
 def filter_resolver_node(state: AgentState) -> dict:
     """LangGraph node wrapper for FilterResolverAgent."""
-    return FilterResolverAgent().resolve(state)
+    return _filter_resolver_agent.resolve(state)
+
+
+# ── Module-level singletons ───────────────────────────────────────────────────
+# FilterResolverAgent is stateless after __init__ (self.llm is immutable).
+# The singleton is shared safely across threads — each resolve() call is
+# completely independent.
+_filter_resolver_agent = FilterResolverAgent()
 
 
 # ── Eagerly start warmup at import time ───────────────────────────────────────

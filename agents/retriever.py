@@ -113,14 +113,28 @@ _CATEGORICAL_COLUMNS: frozenset = frozenset({
 })
 
 
+# ── In-memory cache for column sample values ─────────────────────────────────
+# Keyed on (frozenset(columns), n) so that repeated queries for the same
+# column set hit memory instead of the DB.  Cleared if the process restarts.
+_column_examples_cache: Dict[Tuple[frozenset, int], Dict[str, List[str]]] = {}
+
+
 def _fetch_column_examples(columns: List[str], n: int = 8) -> Dict[str, List[str]]:
     """
     Fetch up to ``n`` distinct non-null sample values for each column in
     ``columns`` using a parallel DB query strategy (one query per column).
 
+    Results are cached in memory for the lifetime of the process so the DB is
+    only queried once per unique (columns, n) combination.
+
     - Silently returns [] for any column that errors or returns no rows.
     - Results are returned in a {col_name: [val, ...]} dict.
     """
+    cache_key = (frozenset(columns), n)
+    if cache_key in _column_examples_cache:
+        logger.debug(f"Schema examples: returning cached values for {len(columns)} column(s)")
+        return _column_examples_cache[cache_key]
+
     from core.database import db_manager
 
     def _fetch(col: str) -> Tuple[str, List[str]]:
@@ -167,6 +181,7 @@ def _fetch_column_examples(columns: List[str], n: int = 8) -> Dict[str, List[str
             except Exception as exc:
                 logger.warning(f"Schema examples: fetch failed for '{col}' — {exc}")
                 results[col] = []
+    _column_examples_cache[cache_key] = results
     return results
 
 
@@ -554,8 +569,7 @@ Comma-separated column names only:"""),
 
 def schema_linker_node(state: AgentState) -> dict:
     """LangGraph node wrapper for SchemaLinkerAgent."""
-    agent = SchemaLinkerAgent()
-    return agent.retrieve_schema(state)
+    return _schema_linker_agent.retrieve_schema(state)
 
 
 def context_builder_node(state: AgentState) -> dict:
@@ -572,7 +586,7 @@ def context_builder_node(state: AgentState) -> dict:
     question = state["question"]
 
     with ThreadPoolExecutor(max_workers=2) as ex:
-        schema_future = ex.submit(SchemaLinkerAgent().retrieve_schema, state)
+        schema_future = ex.submit(_schema_linker_agent.retrieve_schema, state)
         few_shot_future = (
             ex.submit(_few_shot_retriever.retrieve, question)
             if settings.enable_dynamic_few_shot else None
@@ -585,3 +599,10 @@ def context_builder_node(state: AgentState) -> dict:
         f"few_shot({len(examples)} example(s)) retrieved in parallel"
     )
     return {**schema_result, "few_shot_examples": examples}
+
+
+# ── Module-level singleton (created once when the module is first imported) ───
+# SchemaLinkerAgent is stateless beyond __init__ (self.llm is immutable after
+# construction; the LLM object itself is cached in llm_factory).  It is safe
+# to share across threads — each call to retrieve_schema() is independent.
+_schema_linker_agent = SchemaLinkerAgent()

@@ -202,8 +202,13 @@ Conversation history (for resolving follow-up questions):
             return {"error": f"Planning failed: {str(e)}", "should_retry": False}
 
 
+# ── Module-level singleton ───────────────────────────────────────────────────
+# PlannerAgent is stateless beyond __init__; self.llm and self.chain are
+# immutable after construction and the cached LLM is shared safely.
+_planner_agent = PlannerAgent()
+
+
 # Node function for LangGraph
 def planner_node(state: AgentState) -> dict:
     """LangGraph node wrapper for PlannerAgent."""
-    agent = PlannerAgent()
-    return agent.plan(state)
+    return _planner_agent.plan(state)
