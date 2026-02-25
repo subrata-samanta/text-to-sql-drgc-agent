@@ -138,9 +138,11 @@ def _build_few_shot_block(examples: list) -> str:
 # Applied automatically after every LLM generation — before the SQL is used.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Columns known to store YYYYMM integers (never wrap in strftime)
+# Columns that store plain integers and can bypass strftime() in SQLite.
+# NOTE: year_month is a DATE column (yyyy-mm-01), NOT a YYYYMM integer.
+#       Only truly integer time columns belong here.
 _INT_TIME_COLS = re.compile(
-    r"\b(year_month|year_nielsen|quarter_nielsen|month_num|period_num|week_num)\b",
+    r"\b(year_nielsen|month_num|period_num|week_num)\b",
     re.IGNORECASE,
 )
 
@@ -149,9 +151,10 @@ def _fix_sqlite_compat(sql: str) -> str:
     Auto-patch non-SQLite function calls before the query reaches the database.
 
     Handles:
-      YEAR(year_month)     → year_month / 100          (YYYYMM integer → year)
+      YEAR(year_month)     → CAST(strftime('%Y', year_month) AS INTEGER)  (DATE column)
+      YEAR(year_nielsen)   → year_nielsen  (already an INT column)
       YEAR(period_date)    → CAST(strftime('%Y', period_date) AS INTEGER)
-      MONTH(year_month)    → year_month % 100
+      MONTH(year_month)    → CAST(strftime('%m', year_month) AS INTEGER)  (DATE column)
       MONTH(period_date)   → CAST(strftime('%m', period_date) AS INTEGER)
       QUARTER(anything)    → 'quarter_nielsen'  (column exists on the table)
       DATE_FORMAT(c, f)    → strftime(sqlite_fmt, c)

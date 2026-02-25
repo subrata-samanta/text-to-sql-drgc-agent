@@ -140,6 +140,7 @@ _ABBREVIATION_EXPANSIONS: Dict[str, Tuple[str, Optional[str]]] = {
     "mdlz"                      : ("MONDELEZ",                 "manufacturer"),
     "nat valley"                : ("NATURE VALLEY",            "brand"),
     "nat. valley"               : ("NATURE VALLEY",            "brand"),
+    "nature valley"             : ("NATURE VALLEY",            "brand"),
     "conify"                    : ("CONFECTIONARY",            "mega_category"),
     "confectionery"             : ("CONFECTIONARY",            "mega_category"),
     "nutter butter"             : ("NAB NUTTER BUTTER",        "brand"),
@@ -391,6 +392,30 @@ _INTENT_LEVEL_KEYWORDS: Dict[str, List[str]] = {
 # with hyphens in Databricks vs. SQLite's simpler identifier rules).
 _SQLGLOT_DIALECT: str = "databricks" if settings.llm_provider.lower() == "dbrx" else "sqlite"
 
+# Regex: quarter_nielsen = <bare integer 1-4>  (no quotes — invisible to string walker)
+_QUARTER_INT_RE = re.compile(
+    r"(?i)\bquarter_nielsen\s*=\s*([1-4])(?!\d)(?!\s*['\"])"
+)
+
+
+def _fix_quarter_integer(sql: str) -> str:
+    """Rewrite  quarter_nielsen = <1|2|3|4>  →  quarter_nielsen = 'Q<N>'.
+
+    The LLM sometimes emits a bare integer despite the schema description;
+    since it is a numeric literal (not a string), the filter resolver's
+    string-literal walker cannot see or correct it.  This function catches
+    it as a raw regex substitution before the SQL reaches the database.
+    """
+    fixed = _QUARTER_INT_RE.sub(
+        lambda m: f"quarter_nielsen = 'Q{m.group(1)}'", sql
+    )
+    if fixed != sql:
+        logger.info(
+            "FilterResolver: rewrote bare-integer quarter_nielsen filter "
+            "(e.g. = 1 → = 'Q1')"
+        )
+    return fixed
+
 
 def _extract_string_filters(sql: str) -> List[Tuple[str, str]]:
     """
@@ -413,27 +438,34 @@ def _extract_string_filters(sql: str) -> List[Tuple[str, str]]:
         logger.warning(f"FilterResolver: could not parse SQL — {exc}")
         return results
 
-    # Walk every EQ node: col = 'value'
+    def _col_from_expr(node) -> Optional[str]:
+        """Extract a column name from a direct Column node or a single-arg
+        function wrapper such as UPPER(col) / LOWER(col) / TRIM(col).
+        Returns None when no column can be determined."""
+        if isinstance(node, exp.Column):
+            return node.name.lower()
+        # Function wrapping a column: UPPER(t.col), LOWER(col), etc.
+        inner = getattr(node, "this", None)
+        if inner is not None and isinstance(inner, exp.Column):
+            return inner.name.lower()
+        return None
+
+    # Walk every EQ node: col = 'value'  OR  UPPER(col) = 'VALUE'
     for node in tree.find_all(exp.EQ):
         left, right = node.left, node.right
-        col_name = None
+        col_name = _col_from_expr(left)
         lit_val = None
 
-        if isinstance(left, exp.Column):
-            col_name = left.name.lower()
         if isinstance(right, exp.Literal) and right.is_string:
             lit_val = right.this
 
         if col_name and lit_val and col_name not in _SKIP_COLUMNS:
             results.append((col_name, lit_val))
 
-    # Walk IN lists: col IN ('a', 'b')
+    # Walk IN lists: col IN ('a', 'b')  OR  UPPER(col) IN ('A', 'B')
     for node in tree.find_all(exp.In):
-        col_node = node.this
-        if not isinstance(col_node, exp.Column):
-            continue
-        col_name = col_node.name.lower()
-        if col_name in _SKIP_COLUMNS:
+        col_name = _col_from_expr(node.this)
+        if not col_name or col_name in _SKIP_COLUMNS:
             continue
         for expr in node.expressions:
             if isinstance(expr, exp.Literal) and expr.is_string:
@@ -481,6 +513,11 @@ def _rewrite_sql(
     """
     result = sql
 
+    # Collect ALL (old_literal → new_literal) pairs from both correction dicts
+    # so we can run a final broad sweep at the end that catches any form the
+    # structured patterns miss (UPPER(), LIKE, unusual apostrophe encoding, etc.)
+    _all_literal_swaps: List[Tuple[str, str]] = []
+
     # 1. Cross-column corrections first (so value replacement doesn't interfere)
     if column_corrections:
         for (old_col, old_val), (new_col, new_val) in column_corrections.items():
@@ -490,37 +527,67 @@ def _rewrite_sql(
                 value_corrections = dict(value_corrections)  # make mutable copy
                 value_corrections[(old_col, old_val)] = new_val
                 continue
-            # col = 'old_val'  ->  new_col = 'new_val'
-            pattern = re.compile(
+
+            # a) plain EQ:  old_col = 'old_val'  ->  new_col = 'new_val'
+            eq_pattern = re.compile(
                 r"(?i)\b" + re.escape(old_col)
                 + r"(\s*=\s*')" + re.escape(old_val) + r"(')",
             )
-            result = pattern.sub(lambda m, nc=new_col, nv=new_val: f"{nc}{m.group(1)}{nv}{m.group(2)}", result)
-            # Rename the column in any IN clause heading
+            result = eq_pattern.sub(
+                lambda m, nc=new_col, nv=new_val: f"{nc}{m.group(1)}{nv}{m.group(2)}",
+                result,
+            )
+
+            # b) LIKE predicate:  old_col LIKE '%old_val%'  ->  new_col = 'new_val'
+            #    Also handles UPPER(old_col) LIKE and variations.
+            like_pattern = re.compile(
+                r"(?i)(?:UPPER\s*\([^)]*\b" + re.escape(old_col) + r"[^)]*\)|\b"
+                + re.escape(old_col) + r")\s+LIKE\s+'[^']*"
+                + re.escape(old_val) + r"[^']*'",
+            )
+            result = like_pattern.sub(f"{new_col} = '{new_val}'", result)
+
+            # c) Rename the column in any IN clause heading
             in_pattern = re.compile(r"(?i)\b" + re.escape(old_col) + r"(\s+IN\s*\()")
             result = in_pattern.sub(lambda m, nc=new_col: f"{nc}{m.group(1)}", result)
-            # Swap any remaining literal occurrences inside IN list
-            # Handle both plain and SQL-escaped (doubled-apostrophe) forms
-            sql_escaped_old = old_val.replace("'", "''")
-            sql_escaped_new = new_val.replace("'", "''")
-            result = result.replace(f"'{sql_escaped_old}'", f"'{sql_escaped_new}'")
-            if sql_escaped_old != old_val:
-                result = result.replace(f"'{old_val}'", f"'{new_val}'")
+
+            _all_literal_swaps.append((old_val, new_val))
 
     # 2. Same-column value corrections
     for (col, old_val), new_val in value_corrections.items():
         if old_val == new_val:
             continue
-        pattern = re.compile(
+        # a) col = 'old_val' (plain EQ)
+        eq_pattern = re.compile(
             r"(?i)(\b" + re.escape(col) + r"\s*=\s*')(" + re.escape(old_val) + r")(')",
         )
-        result = pattern.sub(lambda m, nv=new_val: m.group(1) + nv + m.group(3), result)
-        # Replace in IN lists — handle both plain and SQL-escaped apostrophes
-        sql_escaped_old = old_val.replace("'", "''")
-        sql_escaped_new = new_val.replace("'", "''")
-        result = result.replace(f"'{sql_escaped_old}'", f"'{sql_escaped_new}'")
-        if sql_escaped_old != old_val:
-            result = result.replace(f"'{old_val}'", f"'{new_val}'")
+        result = eq_pattern.sub(lambda m, nv=new_val: m.group(1) + nv + m.group(3), result)
+        # b) UPPER(col) = 'OLD_VAL'
+        upper_pattern = re.compile(
+            r"(?i)(UPPER\s*\([^)]*\b" + re.escape(col) + r"[^)]*\)\s*=\s*')("
+            + re.escape(old_val.upper()) + r"|" + re.escape(old_val) + r")'",
+        )
+        result = upper_pattern.sub(lambda m, nv=new_val.upper(): m.group(1) + nv + "'", result)
+
+        _all_literal_swaps.append((old_val, new_val))
+
+    # 3. Final broad sweep — replaces 'old_val' wherever it appears between
+    #    single quotes, regardless of surrounding SQL syntax.  This is the
+    #    safety net for UPPER() wrappers, IN lists, and apostrophe-encoding
+    #    variations (doubled '' vs raw ' in LLM-generated SQL).
+    #    Values are specific entity names so false positives are negligible.
+    for old_val, new_val in _all_literal_swaps:
+        if old_val == new_val:
+            continue
+        # Try SQL-escaped form first ('' for embedded apostrophes)
+        sql_esc_old = old_val.replace("'", "''")
+        sql_esc_new = new_val.replace("'", "''")
+        result = result.replace(f"'{sql_esc_old}'", f"'{sql_esc_new}'")
+        # Then the raw form (LLM sometimes omits proper escaping)
+        result = result.replace(f"'{old_val}'", f"'{new_val}'")
+        # Case-insensitive match for UPPER() contexts where LLM uppercased the value
+        if old_val.upper() != old_val:
+            result = result.replace(f"'{old_val.upper()}'", f"'{new_val.upper()}'")
 
     return result
 
@@ -1497,10 +1564,18 @@ class FilterResolverAgent:
         if not sql:
             return {}
 
+        # Fix bare-integer quarter_nielsen filters BEFORE any other step.
+        # These are numeric literals and therefore invisible to the string-
+        # filter walker; we must catch them here with a direct regex pass.
+        sql = _fix_quarter_integer(sql)
+
         logger.info("FilterResolver: scanning SQL for filter values to verify")
 
         filters = _extract_string_filters(sql)
         if not filters:
+            # Even if no string filters remain, return the (possibly fixed) SQL.
+            if sql != state.get("sql_query", ""):
+                return {"sql_query": sql}
             logger.info("FilterResolver: no string filter literals found — skipping")
             return {}
 

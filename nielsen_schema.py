@@ -13,7 +13,11 @@ schema = {
         - type: DATE
         - ALWAYS use the year_month column for monthly aggregations and filters, as all date values within a month are mapped to the first day of that month (yyyy-mm-01).
         - Any queries or filters that require complete month or multiple complete months' data, should utilize the year_month column to ensure accurate and consistent results.
-        - Because the year_month column already represents the month itself not transformations are needed.
+        - Because the year_month column already represents the month itself, no transformation is needed — filter directly with DATE literals (e.g. WHERE year_month = '2025-01-01').
+        - IMPORTANT: year_month is a DATE, NOT an integer. NEVER use year_month % 100, year_month / 100, or any arithmetic on it.
+        - To extract year  → use the year_nielsen column (INT) or YEAR(year_month).
+        - To extract month → use MONTH(year_month) which returns an INT (1-12).
+        - MAX(year_month) returns a DATE; compare it only with DATE literals, not integers.
       """,
       "quarter_nielsen": """
         - type: STRING

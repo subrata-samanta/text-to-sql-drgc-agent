@@ -13,24 +13,34 @@ from config import settings
 _DB_CORRECTION_HINTS: str = (
     """\
 CRITICAL — THIS DATABASE IS Databricks SparkSQL:
-- year_month is a YYYYMM INTEGER (e.g. 202301); YEAR(year_month) is valid but
-  prefer year_nielsen column for year-level filtering.
+- year_month is a DATE column stored as the first day of each month (yyyy-mm-01).
+  Do NOT treat it as an integer. NEVER use year_month % 100 or year_month / 100.
+- To get the year  → use the year_nielsen INT column (preferred) or YEAR(year_month).
+- To get the month → use MONTH(year_month) which returns an INT (1-12).
+- To get the quarter → use the quarter_nielsen STRING column ('Q1'/'Q2'/'Q3'/'Q4').
+- To filter a specific month → WHERE year_month = DATE('2025-01-01') or WHERE year_month = '2025-01-01'.
+- To find the latest month  → MAX(year_month) returns a DATE; compare with DATE literals not integers.
 - YEAR(), MONTH(), QUARTER(), CURRENT_DATE(), COALESCE(), NVL() are all supported.
 - Use LIMIT N (not TOP N) for row limiting.
 - No trailing commas before FROM / GROUP BY / ORDER BY / HAVING."""
     if settings.llm_provider.lower() == "dbrx"
     else """\
 CRITICAL — THIS IS SQLite (NOT MySQL / SQL Server):
-- "no such function: YEAR"    → replace YEAR(col) with: year_nielsen column OR (year_month / 100)
-- "no such function: MONTH"   → replace MONTH(col) with: year_month % 100
+- year_month is a DATE column stored as the first day of each month (yyyy-mm-01).
+  Do NOT treat it as an integer. NEVER use year_month % 100 or year_month / 100.
+- To get the year    → use the year_nielsen INT column (preferred), or CAST(strftime('%Y', year_month) AS INTEGER).
+- To get the month   → use CAST(strftime('%m', year_month) AS INTEGER), or filter year_month directly.
+- To get the quarter → use the quarter_nielsen STRING column ('Q1'/'Q2'/'Q3'/'Q4').
+- To filter a month  → WHERE year_month = '2025-01-01'
+- "no such function: YEAR"    → replace YEAR(col) with: year_nielsen column OR CAST(strftime('%Y', year_month) AS INTEGER)
+- "no such function: MONTH"   → replace MONTH(col) with: CAST(strftime('%m', year_month) AS INTEGER)
 - "no such function: QUARTER" → use quarter_nielsen column directly
 - "no such function: NOW"     → use date('now')
-- "no such function: GETDATE"  → use date('now')
+- "no such function: GETDATE" → use date('now')
 - "no such function: ISNULL"  → use COALESCE(a, b)
 - "no such function: NVL"     → use COALESCE(a, b)
 - "near FROM: syntax error"   → remove trailing comma before FROM / GROUP BY / ORDER BY
-- TOP N not supported         → use LIMIT N
-- year_month is a YYYYMM INTEGER (e.g. 202301); do NOT wrap it in YEAR() or strftime()"""
+- TOP N not supported         → use LIMIT N"""
 )
 
 
