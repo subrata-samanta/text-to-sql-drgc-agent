@@ -137,7 +137,8 @@ Generate the CORRECTED SQL:"""),
             else:
                 # Query succeeded
                 logger.info(f"Query executed successfully in {exec_time:.2f}ms")
-                result_preview = self._format_result_preview(result)
+                question = state.get("question", "")
+                result_preview = self._format_result_preview(result, question=question)
                 
                 return {
                     "query_result": result,
@@ -240,47 +241,90 @@ Generate the CORRECTED SQL:"""),
         else:
             return "runtime_error"
     
-    def _format_result_preview(self, result, max_rows: int = 5) -> str:
+    # Maximum rows ever sent to the LLM for NL generation
+    _LLM_ROW_HARD_CAP = 20
+
+    @staticmethod
+    def _explicit_limit_from_question(question: str) -> int:
         """
-        Format query result for display.
-        
+        Extract an explicit row count from the user question, e.g.
+        "top 5 brands", "first 10 records", "show 3 markets".
+        Returns the number if found (capped at _LLM_ROW_HARD_CAP), otherwise 0.
+        """
+        import re
+        patterns = [
+            r'\btop\s+(\d+)\b',
+            r'\bfirst\s+(\d+)\b',
+            r'\bbottom\s+(\d+)\b',
+            r'\bshow\s+(\d+)\b',
+            r'\blimit\s+(\d+)\b',
+            r'\b(\d+)\s+(?:records?|rows?|results?|entries|items)\b',
+        ]
+        for pat in patterns:
+            m = re.search(pat, question, re.IGNORECASE)
+            if m:
+                return min(int(m.group(1)), CriticAgent._LLM_ROW_HARD_CAP)
+        return 0
+
+    def _format_result_preview(self, result, max_rows: int = 5,
+                               question: str = "") -> str:
+        """
+        Format query result into a compact text preview sent to the LLM.
+
+        Row cap logic (in priority order):
+          1. If the question names an explicit count ("top 5", "first 10") use that.
+          2. Otherwise cap at _LLM_ROW_HARD_CAP (20) — never send more rows
+             than needed to generate a good natural language answer.
+
         Args:
-            result: Query result (list of rows or message)
-            max_rows: Maximum rows to include in preview
-            
+            result:   Query result (list of rows or a plain string message)
+            max_rows: Internal default (ignored when question-based cap applies)
+            question: Original user question — used to detect explicit limits
+
         Returns:
             Formatted string preview
         """
         if isinstance(result, str):
             return result
-        
+
         if not result:
             return "Query returned no results"
-        
+
+        # Decide how many rows to show the LLM
+        explicit = self._explicit_limit_from_question(question)
+        cap = explicit if explicit else self._LLM_ROW_HARD_CAP
+
         try:
-            # Handle list of dicts (preferred) or SQLAlchemy Row objects
+            # Normalise to list-of-dicts
             first = result[0]
             if isinstance(first, dict):
-                rows = result[:max_rows]
+                all_rows = result
             elif hasattr(first, '_mapping'):
-                rows = [dict(row._mapping) for row in result[:max_rows]]
+                all_rows = [dict(row._mapping) for row in result]
             elif hasattr(first, '_asdict'):
-                rows = [row._asdict() for row in result[:max_rows]]
+                all_rows = [row._asdict() for row in result]
             else:
-                return str(result[:max_rows])
+                return str(result[:cap])
 
-            preview = f"Returned {len(result)} row(s). Preview:\n"
+            total   = len(all_rows)
+            rows    = all_rows[:cap]
+
+            preview = f"Returned {total} row(s)"
+            if total > cap:
+                preview += f" (showing first {cap} to LLM)"
+            preview += ".\n"
+
             for i, row in enumerate(rows, 1):
                 preview += f"Row {i}: {row}\n"
 
-            if len(result) > max_rows:
-                preview += f"... ({len(result) - max_rows} more rows)"
+            if total > cap:
+                preview += f"... ({total - cap} more rows not shown to LLM)"
 
             return preview
-                
+
         except Exception as e:
             logger.warning(f"Could not format result: {e}")
-            return str(result)[:500]  # Truncate to 500 chars
+            return str(result)[:500]
 
 
 # ── Module-level singleton ───────────────────────────────────────────────────

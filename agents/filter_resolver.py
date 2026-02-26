@@ -72,7 +72,7 @@ from core.state import AgentState
 _AUTO_CORRECT_THRESHOLD       = 0.50   # minimum combined score to auto-correct
 _HIERARCHY_AMBIGUITY_MARGIN   = 0.10   # top-2 within this -> pick coarser level
 _MIN_STRING_SCORE_FOR_COARSER = 0.30   # Phase 3 override: coarser beats finer above this
-_MAX_DISTINCT                 = 1000   # max DB values per column
+_MAX_DISTINCT                 = 10000   # max DB values per column
 # String-similarity weight dominates so exact/near-exact matches at a different
 # hierarchy level win over poor-string-match same-level candidates.
 _STRING_WEIGHT                = 0.65   # weight for string-similarity in combined score

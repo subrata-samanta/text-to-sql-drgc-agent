@@ -191,6 +191,7 @@ def _run_one(row_no: int, question: str) -> Dict:
         "sql_corrections":     0,
         "execution_time_ms":   "",
         "result_row_count":    "",
+        "result_data_json":    "",
         "llm_answer":          "",
         "total_time_s":        "",
         "error":               "",
@@ -260,9 +261,27 @@ def _run_one(row_no: int, question: str) -> Dict:
         # Validation
         val_issues = final_state.get("validation_issues") or []
 
-        # Result rows
+        # Result rows — normalise to list of dicts and keep all rows
         q_result = final_state.get("query_result")
         row_count = len(q_result) if isinstance(q_result, list) else ""
+
+        # Serialise every row to JSON for storage
+        result_data_json = ""
+        if isinstance(q_result, list) and len(q_result) > 0:
+            try:
+                first = q_result[0]
+                if isinstance(first, dict):
+                    all_dicts = q_result
+                elif hasattr(first, "_mapping"):
+                    all_dicts = [dict(r._mapping) for r in q_result]
+                elif hasattr(first, "_asdict"):
+                    all_dicts = [r._asdict() for r in q_result]
+                else:
+                    all_dicts = [str(r) for r in q_result]
+                result_data_json = json.dumps(all_dicts, ensure_ascii=False,
+                                              default=str)
+            except Exception as _e:
+                result_data_json = f"[serialisation error: {_e}]"
 
         # Steps: human-readable timeline
         steps_tl = _build_timeline(steps, wall_s)
@@ -280,6 +299,7 @@ def _run_one(row_no: int, question: str) -> Dict:
             "sql_corrections":     final_state.get("iterations") or 0,
             "execution_time_ms":   round(final_state.get("execution_time_ms") or 0, 1),
             "result_row_count":    row_count,
+            "result_data_json":    result_data_json,
             "llm_answer":          final_state.get("nl_response")
                                    or final_state.get("direct_response") or "",
             "total_time_s":        round(wall_s, 2),
@@ -439,7 +459,7 @@ _OUTPUT_COLUMNS = [
     "plan", "schema_categories", "few_shot_count",
     "sql_query", "filter_corrections",
     "validation_passed", "validation_issues", "sql_corrections",
-    "execution_time_ms", "result_row_count",
+    "execution_time_ms", "result_row_count", "result_data_json",
     "llm_answer", "total_time_s", "error",
     "steps_timeline", "steps_json",
 ]
@@ -459,12 +479,13 @@ def _save_results(results: List[Dict], out_path: str) -> None:
 
         # Auto-fit column widths (capped)
         _COL_MAX = {
-            "question":       60,
-            "plan":           80,
-            "sql_query":      90,
-            "llm_answer":     80,
-            "steps_timeline": 100,
-            "steps_json":     50,
+            "question":         60,
+            "plan":             80,
+            "sql_query":        90,
+            "llm_answer":       80,
+            "steps_timeline":   100,
+            "steps_json":       50,
+            "result_data_json": 60,
             "filter_corrections": 60,
             "validation_issues":  60,
         }
@@ -481,11 +502,47 @@ def _save_results(results: List[Dict], out_path: str) -> None:
         # Wrap text for long narrative columns
         from openpyxl.styles import Alignment
         _WRAP_COLS = {"plan", "sql_query", "llm_answer",
-                      "steps_timeline", "filter_corrections", "validation_issues"}
+                      "steps_timeline", "filter_corrections",
+                      "validation_issues", "result_data_json"}
         for col_idx, col_name in enumerate(out_df.columns, start=1):
             if col_name in _WRAP_COLS:
                 for row_idx in range(2, len(out_df) + 2):
                     ws.cell(row_idx, col_idx).alignment = Alignment(wrap_text=True)
+
+        # ── Result Data sheet: all rows from every query, stacked ─────────────
+        data_rows: list[dict] = []
+        for rec in results:
+            raw_json = rec.get("result_data_json") or ""
+            if not raw_json:
+                continue
+            try:
+                parsed = json.loads(raw_json)
+                if isinstance(parsed, list):
+                    for r in parsed:
+                        row = {"question_no": rec["question_no"],
+                               "question":    rec["question"]}
+                        if isinstance(r, dict):
+                            row.update(r)
+                        else:
+                            row["value"] = r
+                        data_rows.append(row)
+            except Exception:
+                pass
+
+        if data_rows:
+            data_df = pd.DataFrame(data_rows)
+            data_df.to_excel(writer, index=False, sheet_name="Result Data")
+            ws2 = writer.sheets["Result Data"]
+            ws2.freeze_panes = "A2"
+            # Auto-fit columns on the data sheet
+            for col_idx, col_name in enumerate(data_df.columns, start=1):
+                max_len = max(
+                    len(str(col_name)),
+                    data_df[col_name].astype(str).str.len().max() or 0,
+                )
+                ws2.column_dimensions[
+                    ws2.cell(1, col_idx).column_letter
+                ].width = min(max_len + 2, 50)
 
     tqdm.write(f"\n💾  Saved results → {out_path}")
 

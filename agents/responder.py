@@ -28,13 +28,36 @@ Rules:
 - When the question is a follow-up, use the conversation history for context but answer \
   the current question specifically
 
+Response structure when a qualifier was dropped (check "Filter / query notes"):
+  Step 1 — Answer: Present the numbers from the SQL result, fully and clearly.
+  Step 2 — One-sentence transparency note: After the numbers, add a single sentence \
+    explaining that the result covers the broader matched category (e.g. "Cookies") \
+    because the specific qualifier (e.g. "gluten-free") is not tracked as an attribute \
+    in this dataset.
+  Step 3 — Ask + Suggest: Ask the user if they would like more details, then offer \
+    2–3 concrete follow-up questions.  IMPORTANT: every example in Step 3 MUST use \
+    real values taken from the "Suggestion context" section — do NOT invent brand names, \
+    categories, or sub-categories; only reference values visible in that section.
+
+If "Filter / query notes" says "Filters matched the question exactly.", skip Steps 2 and 3 \
+and answer normally.
+
 Conversation history (most recent turns, for follow-up context):
 {conversation_history}"""
 
 _USER = """Question: {question}
 
+Filter / query notes (qualifiers from the question that could NOT be applied to the SQL):
+{filter_transparency}
+
+SQL clauses actually used:
+{sql_query_snippet}
+
 SQL result:
 {result_preview}
+
+Suggestion context — real database values from the matched category (use ONLY these for follow-up suggestions):
+{suggestion_context}
 
 Answer:"""
 
@@ -116,11 +139,167 @@ class NLResponderAgent:
             for h in history[-4:]
         )
 
+    @staticmethod
+    def _build_filter_transparency(state: AgentState) -> str:
+        """
+        Build a plain-English summary of what the SQL actually filtered on vs
+        what the user originally asked for.  Uses the filter_log written by
+        FilterResolverAgent and the sql_query itself.
+
+        Returns a short bullet list (or "Filters matched the question exactly.").
+        """
+        lines: list[str] = []
+
+        # 1. Filter corrections recorded by the filter resolver
+        filter_log: list[dict] = state.get("filter_log") or []
+        for entry in filter_log:
+            action  = entry.get("action", "")
+            col     = entry.get("column", "")
+            asked   = entry.get("original_value") or entry.get("sql_value", "")
+            matched = entry.get("db_match", "")
+            matched_col = entry.get("matched_column") or col
+
+            if action in ("corrected", "fuzzy_match"):
+                lines.append(
+                    f"- '{asked}' was not found exactly; closest match used: "
+                    f"'{matched}' ({matched_col})"
+                )
+            elif action == "column_corrected":
+                lines.append(
+                    f"- '{asked}' was re-mapped from column '{col}' to "
+                    f"'{matched_col}' (value: '{matched}')"
+                )
+            elif action == "not_found":
+                lines.append(
+                    f"- '{asked}' ({col}) had no match in the database; "
+                    f"filter was dropped from the query"
+                )
+            elif action == "business_rule":
+                lines.append(
+                    f"- '{asked}' was expanded via a business rule to "
+                    f"'{matched}' ({matched_col})"
+                )
+
+        # 2. Scan the question for qualifiers the SQL likely cannot capture
+        question: str = state.get("question") or ""
+        sql: str      = state.get("sql_query") or ""
+
+        _IMPLICIT_QUALIFIERS = [
+            # (question keyword patterns, explanation)
+            (r"\bgluten[- ]?free\b", "gluten-free attribute"),
+            (r"\borganic\b",          "organic attribute"),
+            (r"\bsugar[- ]?free\b",   "sugar-free attribute"),
+            (r"\blow[- ]?sodium\b",   "low-sodium attribute"),
+            (r"\bvegan\b",            "vegan attribute"),
+            (r"\bkosher\b",           "kosher attribute"),
+            (r"\bpremium\b",          "premium tier"),
+            (r"\bprivate[- ]?label\b","private-label segment"),
+            (r"\bnew\b",              "new/innovation flag"),
+            (r"\bseasonal\b",         "seasonal flag"),
+        ]
+        for pattern, label in _IMPLICIT_QUALIFIERS:
+            if re.search(pattern, question, re.IGNORECASE):
+                # Only flag if the qualifier doesn’t appear in the SQL text
+                if not re.search(pattern, sql, re.IGNORECASE):
+                    lines.append(
+                        f"- '{label}' is not a stored column in this dataset; "
+                        f"the query ran without that filter"
+                    )
+
+        if not lines:
+            return "Filters matched the question exactly."
+
+        return "\n".join(lines)
+
+    def _sql_snippet(self, state: AgentState, max_chars: int = 600) -> str:
+        """Return a readable excerpt of the SQL (WHERE + GROUP BY clauses only)."""
+        sql = (state.get("sql_query") or "").strip()
+        if not sql:
+            return "(not available)"
+        # Try to show just the WHERE..GROUP BY part for brevity
+        try:
+            m = re.search(r'(WHERE\b.+?)(?:ORDER BY|LIMIT|$)',
+                          sql, re.IGNORECASE | re.DOTALL)
+            if m:
+                snippet = m.group(1).strip()
+                if len(snippet) > max_chars:
+                    snippet = snippet[:max_chars] + " …"
+                return snippet
+        except Exception:
+            pass
+        return sql[:max_chars] + (" …" if len(sql) > max_chars else "")
+
+    def _build_suggestion_context(self, state: AgentState) -> str:
+        """
+        When a qualifier was silently dropped (e.g. gluten-free), query the DB
+        using the SAME WHERE conditions that were actually executed, and return
+        real values (brands, sub-categories, products) from that matched scope.
+        The LLM uses these to compose concrete, factual follow-up suggestions.
+        Returns an empty string when no qualifier was dropped.
+        """
+        # Only needed when something was dropped
+        transparency = self._build_filter_transparency(state)
+        if transparency == "Filters matched the question exactly.":
+            return "(none — filters matched exactly)"
+
+        from core.database import db_manager  # lazy import
+
+        sql = state.get("sql_query") or ""
+        fallback_table = self._extract_main_table(sql)
+        if not fallback_table:
+            return "(table not identified)"
+
+        # Reuse the executed WHERE clause so samples are scoped to the matched category
+        where_match = re.search(
+            r'(WHERE\b.+?)(?:GROUP\s+BY|ORDER\s+BY|LIMIT|HAVING|$)',
+            sql, re.IGNORECASE | re.DOTALL
+        )
+        where_clause = where_match.group(1).strip() if where_match else ""
+
+        # Columns that produce useful follow-up suggestions
+        suggestion_cols = [
+            "BRAND_NAME", "SUB_CATEGORY_NAME", "CATEGORY_NAME",
+            "PRODUCT_DESCRIPTION", "MANUFACTURER_NAME",
+        ]
+        lines: list[str] = []
+        for col in suggestion_cols:
+            try:
+                q = f'SELECT DISTINCT "{col}" FROM "{fallback_table}"'
+                if where_clause:
+                    q += f" {where_clause}"
+                q += f' WHERE "{col}" IS NOT NULL ORDER BY "{col}" LIMIT 8' \
+                     if not where_clause else \
+                     f' AND "{col}" IS NOT NULL ORDER BY "{col}" LIMIT 8'
+                rows, err, _ = db_manager.execute_query(q, timeout=10)
+                if err or not rows:
+                    continue
+                vals: list[str] = []
+                for r in rows:
+                    if isinstance(r, dict):
+                        v = list(r.values())[0]
+                    elif hasattr(r, "_mapping"):
+                        v = list(dict(r._mapping).values())[0]
+                    else:
+                        v = str(r)
+                    if v:
+                        vals.append(str(v))
+                if vals:
+                    lines.append(f"• {col}: {', '.join(vals)}")
+            except Exception as exc:
+                logger.debug(f"Suggestion-context query failed for {col}: {exc}")
+                continue
+
+        return "\n".join(lines) or "(no sample values available)"
+
     def _build_input(self, state: AgentState, history: Optional[List[Dict]]) -> dict:
+        filter_transparency = self._build_filter_transparency(state)
         return {
-            "question": state["question"],
-            "result_preview": state.get("result_preview") or "No results returned.",
+            "question":             state["question"],
+            "result_preview":       state.get("result_preview") or "No results returned.",
             "conversation_history": self._history_text(history),
+            "filter_transparency":  filter_transparency,
+            "sql_query_snippet":    self._sql_snippet(state),
+            "suggestion_context":   self._build_suggestion_context(state),
         }
 
     # ── no-data helpers ───────────────────────────────────────────────────────
