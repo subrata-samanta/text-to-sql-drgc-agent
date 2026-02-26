@@ -60,10 +60,17 @@ def create_llm(tier: str = "reasoning", streaming: bool = False) -> BaseChatMode
 
     if provider == "dbrx":
         from langchain_openai import ChatOpenAI
+        # "reasoning" tier → Gemini 2.5 Pro  (SQL generation only)
+        # "fast" tier      → Gemini 2.5 Flash (all other tasks)
+        dbrx_model = (
+            settings.dbrx_model_reasoning
+            if tier == "reasoning"
+            else settings.dbrx_model
+        )
         llm: BaseChatModel = ChatOpenAI(
             api_key=settings.dbrx_api_key,
             base_url=settings.dbrx_base_url,
-            model=settings.dbrx_model,
+            model=dbrx_model,
             temperature=settings.dbrx_temperature,
             max_tokens=settings.dbrx_max_tokens,
             streaming=streaming,

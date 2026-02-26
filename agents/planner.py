@@ -33,7 +33,7 @@ class PlannerAgent:
     and identifies the minimal set of schema categories required."""
 
     def __init__(self):
-        self.llm = create_llm("reasoning")
+        self.llm = create_llm("fast")
 
         # System prompt for logical planning + category selection
         self.prompt = ChatPromptTemplate.from_messages([

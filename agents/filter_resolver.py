@@ -1465,12 +1465,26 @@ def _resolve_one(
     # scoring so that e.g. "SPK" → "SOUR PATCH KIDS" rather than scoring ~0
     # against all DB values.
     #
-    # Resolution order (see _llm_expand_entity for full details):
-    #   1. In-process cache (pre-seeded from _ABBREVIATION_EXPANSIONS — free)
-    #   2. Partial-prefix scan against seed keys (free)
-    #   3. LLM call with result cached — handles unseen CPG names without any
-    #      code changes, making the resolver fully scalable to new products.
-    expanded_guessed, col_hint = _llm_expand_entity(llm, guessed, question)
+    # IMPORTANT: Skip expansion if the value already exists verbatim in ANY
+    # cached DB column.  LLM expansion of an already-valid DB value can corrupt
+    # it — e.g. 'NAB RITZ CRK' (exact brand) would be "helpfully" expanded to
+    # 'NAB RITZ CRACKERFULS' (a subbrand), causing the wrong column to be chosen.
+    # An exact DB hit means the value is already canonical; scoring handles the rest.
+    guessed_norm = guessed.upper().strip()
+    _already_in_db = any(
+        any(v.upper().strip() == guessed_norm for v in vals)
+        for vals in cached_values.values()
+        if vals
+    )
+    if _already_in_db:
+        expanded_guessed, col_hint = guessed, None
+        logger.debug(
+            f"FilterResolver: '{guessed}' already exists verbatim in DB cache "
+            "— skipping entity expansion to preserve exact match"
+        )
+    else:
+        expanded_guessed, col_hint = _llm_expand_entity(llm, guessed, question)
+
     if expanded_guessed != guessed:
         # If the expansion supplies a preferred column hint, trust it over the
         # LLM-generated column name (which is often wrong for abbreviations).
@@ -1488,6 +1502,38 @@ def _resolve_one(
         logger.info(f"FilterResolver: column '{column}' mapped to '{real_column}'")
 
     effective_column = real_column or column
+
+    # ── Exact-match hierarchy redirect ────────────────────────────────────────
+    # When the SQL uses a non-hierarchy column (e.g. product_name, upc) but the
+    # filter value is an exact match in a cached hierarchy column (e.g. brand),
+    # redirect to that hierarchy column so the hierarchy resolver runs and
+    # returns the correct column name.
+    #
+    # Example: product_name = 'NAB RITZ CRK'
+    #   → exact hit in cached_values['brand'] → redirect effective_column to 'brand'
+    #   → hierarchy resolver returns brand = 'NAB RITZ CRK'  (perfect-match guard)
+    #
+    # Priority order matches coarsest→finest in _PRODUCT_HIERARCHY so that
+    # brand beats subbrand when the same string exists at multiple levels.
+    if effective_column not in _ALL_HIERARCHY_COLUMNS and _already_in_db:
+        _redirect_col: Optional[str] = None
+        _redirect_priority = len(_PRODUCT_HIERARCHY) + len(_CATEGORY_HIERARCHY) + len(_GEO_HIERARCHY)
+        for hier_list in (_CATEGORY_HIERARCHY, _PRODUCT_HIERARCHY, _GEO_HIERARCHY):
+            for hier_col in hier_list:
+                vals = cached_values.get(hier_col, [])
+                if any(v.upper().strip() == guessed_norm for v in vals):
+                    idx = hier_list.index(hier_col)
+                    if idx < _redirect_priority:
+                        _redirect_priority = idx
+                        _redirect_col = hier_col
+                        _redirect_hierarchy = hier_list
+        if _redirect_col:
+            logger.info(
+                f"FilterResolver: exact-match redirect — '{effective_column}'='{guessed}' "
+                f"found verbatim in hierarchy column '{_redirect_col}'; "
+                f"routing to hierarchy resolver on '{_redirect_col}'"
+            )
+            effective_column = _redirect_col
 
     if effective_column in _ALL_HIERARCHY_COLUMNS:
         hierarchy = _COLUMN_TO_HIERARCHY[effective_column]

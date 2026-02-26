@@ -22,9 +22,12 @@ class Settings(BaseSettings):
     groq_model_fast: str = Field(default="llama-3.1-8b-instant", env="GROQ_MODEL_FAST")
     groq_temperature: float = Field(default=0.0, env="GROQ_TEMPERATURE")
 
-    # ── DBRX / Databricks — Gemini 2.5 Flash ─────────────────────────────────
+    # ── DBRX / Databricks ─────────────────────────────────────────────────────
     dbrx_api_key: str = Field(default="", env="DBRX_API_KEY")
     dbrx_base_url: str = Field(default="", env="DBRX_BASE_URL")
+    # Heavy model — SQL generation only (generator agent, "reasoning" tier)
+    dbrx_model_reasoning: str = Field(default="databricks-gemini-2-5-pro", env="DBRX_MODEL_REASONING")
+    # Light model — all other tasks: planning, filter resolution, critic, etc.
     dbrx_model: str = Field(default="databricks-gemini-2-5-flash", env="DBRX_MODEL")
     dbrx_temperature: float = Field(default=0.0, env="DBRX_TEMPERATURE")
     dbrx_max_tokens: int = Field(default=8192, env="DBRX_MAX_TOKENS")

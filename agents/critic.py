@@ -51,7 +51,7 @@ class CriticAgent:
     """
     
     def __init__(self):
-        self.llm = create_llm("reasoning")
+        self.llm = create_llm("fast")
         
         # Prompt for error correction
         self.reflection_prompt = ChatPromptTemplate.from_messages([
