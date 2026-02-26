@@ -159,6 +159,9 @@ _ABBREVIATION_EXPANSIONS: Dict[str, Tuple[str, Optional[str]]] = {
     "p&g"                       : ("P&G",                      "manufacturer"),
     "procter & gamble"          : ("P&G",                      "manufacturer"),
     "procter and gamble"        : ("P&G",                      "manufacturer"),
+    "firehook"                  : ("FIREHOOK",                 "manufacturer"),
+    "firehoo"                   : ("FIREHOOK",                 "manufacturer"),
+    "fireho0e"                  : ("FIREHOOK",                 "manufacturer"),
     # ── Sub-category Nielsen code seeds ───────────────────────────────────
     # These Nielsen codes are cryptic enough that the LLM cannot infer them;
     # seed them here so no LLM call is needed for the fuzzy phase.

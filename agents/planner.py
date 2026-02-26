@@ -122,6 +122,17 @@ PLANNING GUIDELINES
    conversation history to identify what it refers to and name it explicitly in the plan.
 5. Break down into atomic logical steps: filters → aggregations → calculations → comparisons.
 6. Define metrics and formulas explicitly (e.g., tdp_growth = (current_tdp - prior_tdp) / prior_tdp * 100).
+7. YTD (Year-to-Date) comparisons MUST follow this pattern:
+   a. YTD <year> = all rows WHERE period_date <= '<latest Saturday in <year>'
+      AND period_date >= '<year>-01-01'  (or equivalent year_month range).
+   b. For YTD vs prior-year comparison, align both windows to the SAME day-of-year:
+      YTD current: period_date BETWEEN '<year>-01-01' AND <max_period_date in current year>
+      YTD prior:   period_date BETWEEN '<prior_year>-01-01'
+                                   AND ADD_MONTHS(<max_period_date_current_year>, -12)
+      (SQLite equivalent: date(<max_period_date>, '-1 year'))
+   c. NEVER compare raw annual totals when the question asks for YTD.
+8. quarter_nielsen is always a STRING with Q prefix: 'Q1', 'Q2', 'Q3', 'Q4'.
+   NEVER use bare integers (1, 2, 3, 4) when filtering quarter_nielsen.
 
 ═══════════════════════════════════════════════════════════
 OUTPUT FORMAT  (follow this exactly)

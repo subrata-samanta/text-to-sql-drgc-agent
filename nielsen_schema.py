@@ -63,11 +63,25 @@ schema = {
     "category_hierarchy": {
       "mega_category": """
         - type: STRING
-        - mega_category represents a higher-level classification of the product category.
+        - mega_category represents a higher-level (broader) classification of the product category.
+        - IMPORTANT: mega_category sits ABOVE category in the hierarchy. When the user mentions a
+          broad segment word (e.g. "biscuits", "confectionary", "bars"), prefer mega_category.
+        - Known mega_category values (use these exact strings):
+            'CONFECTIONARY', 'TOTAL BARS', 'COUGH PROTECTION/RELIEF', 'BISCUITS'
+        - Do NOT confuse with category values. mega_category ≠ category.
       """,
       "category": """
         - type: STRING
-        - category represents the primary classification of the product.
+        - category represents the primary classification of the product — one level below mega_category.
+        - IMPORTANT: category sits BELOW mega_category. When the user mentions a specific product type
+          (e.g. "cookies", "crackers", "cough drops"), prefer category.
+        - Known category values (use these exact strings):
+            'COOKIE', 'COUGH DROP', 'TOTAL BARS', 'CRACKER', 'NON CHOCOLATE'
+        - Do NOT confuse with mega_category values. category ≠ mega_category.
+        - DISAMBIGUATION RULE:
+            User says "biscuits" or "confectionary"  → mega_category
+            User says "cookies" or "crackers"         → category
+            User says "bars" (standalone)             → could be either; default to mega_category = 'TOTAL BARS'
       """,
       "sub_category": """
         - type: STRING

@@ -31,6 +31,8 @@ CRITICAL — THIS IS SQLite (NOT MySQL / SQL Server):
 - To get the year    → use the year_nielsen INT column (preferred), or CAST(strftime('%Y', year_month) AS INTEGER).
 - To get the month   → use CAST(strftime('%m', year_month) AS INTEGER), or filter year_month directly.
 - To get the quarter → use the quarter_nielsen STRING column ('Q1'/'Q2'/'Q3'/'Q4').
+- quarter_nielsen values are STRINGS: 'Q1', 'Q2', 'Q3', 'Q4'. NEVER bare integers (1, 2, 3, 4).
+  WRONG: quarter_nielsen = 4   CORRECT: quarter_nielsen = 'Q4'
 - To filter a month  → WHERE year_month = '2025-01-01'
 - "no such function: YEAR"    → replace YEAR(col) with: year_nielsen column OR CAST(strftime('%Y', year_month) AS INTEGER)
 - "no such function: MONTH"   → replace MONTH(col) with: CAST(strftime('%m', year_month) AS INTEGER)

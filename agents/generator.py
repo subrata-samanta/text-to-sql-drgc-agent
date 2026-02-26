@@ -216,6 +216,17 @@ def _fix_sqlite_compat(sql: str) -> str:
         sql, flags=re.IGNORECASE,
     )
 
+    # ── 9. quarter_nielsen = <bare integer> → quarter_nielsen = 'Q<N>' ──────
+    # e.g.  quarter_nielsen = 4   →  quarter_nielsen = 'Q4'
+    def _fix_quarter_int(m: re.Match) -> str:
+        n = m.group(1)
+        return f"quarter_nielsen = 'Q{n}'"
+
+    sql = re.sub(
+        r"quarter_nielsen\s*=\s*([1-4])(?![\w'])",
+        _fix_quarter_int, sql, flags=re.IGNORECASE,
+    )
+
     if sql != original:
         changed = []
         checks = [
@@ -225,6 +236,7 @@ def _fix_sqlite_compat(sql: str) -> str:
             (r"\bDATE_FORMAT\s*\(", "DATE_FORMAT()"),
             (r"\b(GETDATE|NOW)\s*\(", "GETDATE/NOW()"),
             (r"\b(ISNULL|NVL)\s*\(", "ISNULL/NVL()"),
+            (r"quarter_nielsen\s*=\s*[1-4](?![\w'])", "quarter_nielsen-bare-int"),
         ]
         for pat, label in checks:
             if re.search(pat, original, flags=re.IGNORECASE):
@@ -233,6 +245,90 @@ def _fix_sqlite_compat(sql: str) -> str:
             changed.append("trailing-comma")
         logger.info(f"SQLite compat patcher fixed: {', '.join(changed) or 'misc'}")
 
+    return sql
+
+
+def _fix_dbrx_compat(sql: str) -> str:
+    """
+    Auto-patch common Databricks SparkSQL mistakes before the query is executed.
+
+    Handles:
+      date_add(col, INTERVAL 'N' YEAR)  → ADD_MONTHS(col, N*12)
+      date_add(col, INTERVAL 'N' MONTH) → ADD_MONTHS(col, N)
+      date_add(col, INTERVAL 'N' DAY)   → DATE_ADD(col, N)   (SparkSQL native)
+      year_month % 100                  → MONTH(year_month)  (year_month is DATE)
+      year_month / 100                  → YEAR(year_month)   (year_month is DATE)
+      quarter_nielsen = <bare integer>  → quarter_nielsen = 'Q<N>'
+    """
+    original = sql
+
+    # ── 1. date_add(col, INTERVAL 'N' YEAR) → ADD_MONTHS(col, N*12) ──────────
+    def _fix_interval_year(m: re.Match) -> str:
+        col, n = m.group(1).strip(), int(m.group(2))
+        return f"ADD_MONTHS({col}, {n * 12})"
+
+    sql = re.sub(
+        r"date_add\s*\(([^,]+),\s*INTERVAL\s+'(\d+)'\s+YEAR\s*\)",
+        _fix_interval_year, sql, flags=re.IGNORECASE,
+    )
+    # Also handle unquoted: INTERVAL 1 YEAR
+    sql = re.sub(
+        r"date_add\s*\(([^,]+),\s*INTERVAL\s+(\d+)\s+YEAR\s*\)",
+        _fix_interval_year, sql, flags=re.IGNORECASE,
+    )
+
+    # ── 2. date_add(col, INTERVAL 'N' MONTH) → ADD_MONTHS(col, N) ────────────
+    def _fix_interval_month(m: re.Match) -> str:
+        col, n = m.group(1).strip(), int(m.group(2))
+        return f"ADD_MONTHS({col}, {n})"
+
+    sql = re.sub(
+        r"date_add\s*\(([^,]+),\s*INTERVAL\s+'(\d+)'\s+MONTH\s*\)",
+        _fix_interval_month, sql, flags=re.IGNORECASE,
+    )
+    sql = re.sub(
+        r"date_add\s*\(([^,]+),\s*INTERVAL\s+(\d+)\s+MONTH\s*\)",
+        _fix_interval_month, sql, flags=re.IGNORECASE,
+    )
+
+    # ── 3. date_add(col, INTERVAL 'N' DAY) → DATE_ADD(col, N) ───────────────
+    def _fix_interval_day(m: re.Match) -> str:
+        col, n = m.group(1).strip(), int(m.group(2))
+        return f"DATE_ADD({col}, {n})"
+
+    sql = re.sub(
+        r"date_add\s*\(([^,]+),\s*INTERVAL\s+'(\d+)'\s+DAY\s*\)",
+        _fix_interval_day, sql, flags=re.IGNORECASE,
+    )
+    sql = re.sub(
+        r"date_add\s*\(([^,]+),\s*INTERVAL\s+(\d+)\s+DAY\s*\)",
+        _fix_interval_day, sql, flags=re.IGNORECASE,
+    )
+
+    # ── 4. year_month % 100 → MONTH(year_month)  (year_month is a DATE) ──────
+    sql = re.sub(
+        r"year_month\s*%\s*100",
+        "MONTH(year_month)", sql, flags=re.IGNORECASE,
+    )
+    # ── 5. year_month / 100 → YEAR(year_month) ───────────────────────────────
+    sql = re.sub(
+        r"year_month\s*/\s*100",
+        "YEAR(year_month)", sql, flags=re.IGNORECASE,
+    )
+
+    # ── 6. quarter_nielsen = <bare integer> → quarter_nielsen = 'Q<N>' ───────
+    def _fix_quarter_int_dbrx(m: re.Match) -> str:
+        n = m.group(1)
+        return f"quarter_nielsen = 'Q{n}'"
+
+    sql = re.sub(
+        r"quarter_nielsen\s*=\s*([1-4])(?![\w'])",
+        _fix_quarter_int_dbrx, sql, flags=re.IGNORECASE,
+    )
+
+    if sql != original:
+        logger.info("Databricks compat patcher: fixed one or more dialect issues "
+                    "(date_add INTERVAL / year_month arithmetic / quarter_nielsen bare-int)")
     return sql
 
 
@@ -401,10 +497,11 @@ class SQLGeneratorAgent:
                 "Increase DBRX_MAX_TOKENS in .env and retry."
             )
 
-        # For dbrx: normalise any incorrect quoting of the fully-qualified table
-        # name (LLMs sometimes emit single/double quotes instead of backticks).
+        # For dbrx: normalise quoting of the fully-qualified table name then
+        # patch common Databricks SparkSQL dialect mistakes.
         if settings.llm_provider.lower() == "dbrx":
             sql = _fix_dbrx_table_quoting(sql)
+            sql = _fix_dbrx_compat(sql)
         else:
             # Auto-patch SQLite incompatible functions (YEAR, MONTH, QUARTER, etc.)
             sql = _fix_sqlite_compat(sql)
